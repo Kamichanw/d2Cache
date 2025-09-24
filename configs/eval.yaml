@@ -1,0 +1,30 @@
+defaults:
+    - default
+    - _self_
+
+mc_num: null
+max_length: 4096
+
+# whether to use response cache of lm-eval
+# if set to true, "response_rank{\d}.db" will be created in the hydra output dir.
+use_eval_cache: false 
+
+# llada
+is_check_greedy: true
+
+# dream
+add_bos_token: true
+nll_type: "mc"
+log_type: "ftb"
+
+eval_args:
+    log_samples: true
+    tasks: ${..dataset.name}
+    num_fewshot: ${..dataset.n_shot}
+    batch_size: ${..batch_size}
+    limit: ${..dataset.size}
+    confirm_run_unsafe_code: true
+    random_seed: ${..seed}
+    fewshot_random_seed: ${..seed}
+    numpy_random_seed: ${..seed}
+    torch_random_seed: ${..seed}

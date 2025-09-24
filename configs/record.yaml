@@ -1,0 +1,20 @@
+defaults:
+    - default
+    - _self_
+
+predict_only: true # if set to true, all other fields will not be saved
+
+hidden_states:
+    enabled: ${eval:not ${..predict_only}} # if set to true, the hidden states from specific layers will be saved.
+    return_indices: [-2] # can be a list of layer indices, or 'null' for all layers
+    include_prompts: true
+
+confidence:
+    enabled: ${eval:not ${..predict_only}}
+    overall: true # whether to return confidence of all tokens, i.e., delta.probs.
+
+attention:
+    enabled: ${eval:not ${..predict_only}}
+    type: "qvk" # can be any combination of "q", "k", "v" and "o"
+    return_indices: [-1]
+    include_prompts: true

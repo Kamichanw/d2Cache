@@ -1,0 +1,4 @@
+generation:
+    mask_token_id: 126336
+    eot_token_id: 126081
+    pad_token_id: 126081

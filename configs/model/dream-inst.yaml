@@ -1,0 +1,6 @@
+defaults:
+  - dream-common
+  - _self_
+
+name: dream-inst
+path: ${oc.env:DREAM_INST_PATH}

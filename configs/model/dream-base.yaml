@@ -1,0 +1,6 @@
+defaults:
+  - dream-common
+  - _self_
+  
+name: dream-base
+path: ${oc.env:DREAM_BASE_PATH}

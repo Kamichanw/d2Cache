@@ -1,0 +1,19 @@
+# extra generation configs will be loaded from the model config during runtime
+strategy: vanilla
+
+# parallel decoding proposed in https://arxiv.org/abs/2505.22618, only one of these two can be specified
+threshold: null # all tokens whose confidence is above this threshold will be fixed
+factor: null # factor-based parallel decoding factor
+
+gen_length: 256
+steps: 256
+temperature: 0.0
+top_p: null
+top_k: null
+
+# whether to use debiasing trivial tokens, see https://arxiv.org/pdf/2508.13021
+# to enable debiasing, {model-family.lower()}_corpus.json should be placed in the src/third_party/ directory
+# e.g., llada_corpus.json for LLaDA
+debias: false
+
+output_probs: false

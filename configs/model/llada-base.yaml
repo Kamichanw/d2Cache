@@ -1,0 +1,6 @@
+defaults:
+  - llada-common
+  - _self_
+  
+name: llada-base
+path: ${oc.env:LLADA_BASE_PATH}

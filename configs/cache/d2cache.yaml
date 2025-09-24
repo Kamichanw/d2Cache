@@ -1,0 +1,4 @@
+_target_: src.cache.d2Cache
+rollout_p: 0.2
+current_k: 32
+sigma: 10.0

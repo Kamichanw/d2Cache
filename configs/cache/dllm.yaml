@@ -1,0 +1,4 @@
+_target_: src.cache.dLLMCache
+kr: 1 # update interval for response part
+kp: 50 # update interval for prompt part
+rou: 0.25 # adaptive update ratio for response tokens
