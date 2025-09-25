@@ -1,10 +1,10 @@
-# Heat
+# d2Cache
 
 # Setup
 ```bash
 # Create and activate the environment
-conda create -n heat python=3.11 -y
-conda activate heat
+conda create -n d2cache python=3.11 -y
+conda activate d2cache
 
 # Install dependencies
 pip install -r requirements/common.txt

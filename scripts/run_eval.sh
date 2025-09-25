@@ -13,7 +13,7 @@ accelerate launch \
     dataset.name=${DATASET} \
     batch_size=1 \
     seed=1234 \
-    cache=heat \
+    cache=d2cache \
     generation=dyna \
     model=${MODEL} \
     hydra.run.dir=${OUTPUT_DIR}
