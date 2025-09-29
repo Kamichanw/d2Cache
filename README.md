@@ -1,5 +1,12 @@
-# d2Cache
+<h1 align="center">	d²Cache: Accelerating Diffusion-Based LLMs via Dual Adaptive Caching </h1>
+<p align="center">
+<a href="">
+<img alt="Static Badge" src="https://img.shields.io/badge/arXiv-comingsoon-red"></a>
 
+**Dual aDaptive Cache (d²Cache)** is a novel, training-free framework that accelerates inference for diffusion-based large language models (dLLMs) while also improving generation quality. It achieves substantial speedups and consistent quality gains over standard decoding and previsou proposed KV cache methods on various representative dLLMs.
+
+ # News
+[25/8/30] We released [code reading guides](./docs/code_reading_guides.md), hoping this can help you to grasp our work :)
 # Setup
 ```bash
 # Create and activate the environment
