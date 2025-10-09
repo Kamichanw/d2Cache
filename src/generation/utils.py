@@ -11,7 +11,7 @@ def prepare_logits_for_generation(model, logits: torch.Tensor):
     if isinstance(model, LLaDAModelLM):
         ...
     elif isinstance(model, DreamModel):
-        # see https://github.com/DreamLM/Dream/issues/31
+        # main difference with LLaDA, see https://github.com/DreamLM/Dream/issues/31
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
     return logits
 

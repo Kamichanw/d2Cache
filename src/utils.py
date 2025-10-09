@@ -451,6 +451,59 @@ def nucleus_select(
     )
 
 
+def pad_mask_(
+    mask: torch.Tensor, target_count: int, scores: torch.Tensor
+) -> torch.Tensor:
+    """
+    Pads a boolean mask to ensure each row has a target number of True values.
+    It selects pad positions which `False` positions to flip to `True` based on the provided `scores`.
+
+    Args:
+        mask (torch.Tensor): The boolean mask to be padded.
+                             Shape: (B, L), where B is batch size and L is sequence length.
+        target_count (int): The desired total number of `True` values for each row
+                            after padding.
+        scores (torch.Tensor): The scores used to select which `False` positions to
+                               flip to `True`. Higher scores are selected first.
+                               Should have the same shape as `mask`.
+
+    Returns:
+        torch.Tensor: The modified mask tensor with padded `True` values.
+                      Note: The modification is done in-place.
+    """
+    B, _ = mask.shape
+    device = mask.device
+
+    num_selected_per_seq = mask.sum(dim=-1)
+    num_to_pad_per_seq = (target_count - num_selected_per_seq).clamp(min=0)
+
+    if num_to_pad_per_seq.sum() == 0:
+        return mask
+
+    max_num_to_pad = int(num_to_pad_per_seq.max())
+    scores = torch.where(mask, -torch.inf, scores)
+
+    _, indices = torch.topk(
+        scores,
+        k=max_num_to_pad,
+        dim=-1,
+    )
+
+    # select the indices that really need to be set to true
+    pad_indices = indices.masked_select(
+        torch.arange(max_num_to_pad, device=device).expand(B, -1)
+        < num_to_pad_per_seq.unsqueeze(-1)
+    )
+
+    row_indices = torch.repeat_interleave(
+        torch.arange(B, device=device),
+        num_to_pad_per_seq.long(),
+    )
+    mask[row_indices, pad_indices] = True
+
+    return mask
+
+
 @contextmanager
 def sympy_antlr_patcher(target_version: str = "4.11.0"):
     """
@@ -483,8 +536,6 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
                 "--no-deps",
                 "-d",
                 temp_dir,
-                "--trusted-host",
-                "pypi.mirrors.qihoo.net.s.qihucdn.com",
             ],
             check=True,
             capture_output=True,
@@ -614,13 +665,12 @@ def pre_initialize(cfg: DictConfig) -> dict:
     if cfg.get("cache") is not None:
         # order: predefined args -> cli overrided args
         cache_args.update(get_config_diff(cfg["cache"], default_cfg.get("cache", {})))
-        if cache_args:
-            logger.info(
-                f"Using cache with args: {re.sub(r'{', '{{', re.sub(r'}', '}}', str(cache_args)))}",
-                rank_zero_only=True,
-            )
         extra_gen_kwargs["cache_cls"] = instantiate(
             cfg.cache, **cache_args, _partial_=True
+        )
+        logger.info(
+            re.sub(r"{", "{{", re.sub(r"}", "}}", str(extra_gen_kwargs["cache_cls"]))),
+            rank_zero_only=True,
         )
 
     if attn_cfg := cfg.get("attention"):

@@ -212,3 +212,5 @@ results*/
 debug.ipynb
 code_eval/
 explore/
+.vscode/
+run.sh

@@ -20,7 +20,7 @@ The implementations of the generation methods are located in the `src/generation
 
 We have designed a unified interface for caching mechanisms, located in `src/cache.py`. The core logic for token selection and restoration is managed by three key context managers: `@model_forward`, `@attention`, and `@ffn`. These managers are responsible for manipulating the inputs and outputs of their respective modules (the full model, self-attention blocks, and feed-forward networks). The overall process is depicted in the figure below.
 
-<img src="../assets/hooks.png" width="500px" style="display: block; margin: 0 auto; width: 90%;">
+<img src="../assets/hooks.png" width="500px" style="display: block; margin: 0 auto; width: 60%;">
 
 As detailed in our [paper](./paper.pdf), the KV caching strategy for dLLMs involves selecting a subset of essential tokens for re-computation, while the states of the remaining tokens are served from the cache.
 

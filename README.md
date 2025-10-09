@@ -49,15 +49,15 @@ Available cache methods:
 
 Additional general arguments can be specified in `configs/geneation/*.yaml` or `configs/gen_args.py`.
 
->>> [!NOTE]
-Batch inference is partially supported and not well tested. If you need this feature, feel free to open an issue or a PR directly!
+> [!NOTE]
+> Batch inference is partially supported and not well tested. If you need this feature, feel free to open an issue or a PR directly!
 
 # Citation
 If you find d²Cache useful for your research and applications, please cite using this BibTeX:
 ```bibtex
 @article{jiang2025d2cache,
-  title={d$^2$Cache: Accelerating Diffusion-Based LLMs via Dual Adaptive Caching}, 
-  author={Yuchu Jiang and Yue Cai and Xiangzhong Luo and Jiale Fu and Jiarui Wang and Chonghan Liu and Xu Yang},
+  title={d $\^{} 2$ Cache: Accelerating Diffusion-Based LLMs via Dual Adaptive Caching},
+  author={Jiang, Yuchu and Cai, Yue and Luo, Xiangzhong and Fu, Jiale and Wang, Jiarui and Liu, Chonghan and Yang, Xu},
   journal={arXiv preprint arXiv:2509.23094},
   year={2025}
 }

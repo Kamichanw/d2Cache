@@ -1,8 +1,12 @@
-from datetime import timedelta
 import os
 import accelerate
 import torch
+import itertools
 
+from typing import cast
+from contextlib import nullcontext
+from datetime import timedelta
+from functools import partial
 from omegaconf import DictConfig
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.instance import Instance
@@ -15,6 +19,7 @@ from src.frame import Frame
 from src.generation import generate, decode_final_frame
 from src.utils import Timer, load_pretrained_model
 from src.eval_model.sanitize import sanitize
+from src.cache import d2Cache, PrefixCache
 
 
 class EvalModelBase(TemplateLM):
@@ -105,21 +110,35 @@ class EvalModelBase(TemplateLM):
         out, throughput, tps = [], [], []
         full_throughput, full_tps = [], []
         latency = []
-        for instance in tqdm(
-            requests,
+
+        batch_size = self.cfg.get("batch_size", 1)
+
+        def batched(iterable):
+            """
+            A quick implementation of itertools.batched for Python versions < 3.12.
+            """
+            it = iter(iterable)
+            while batch := tuple(itertools.islice(it, batch_size)):
+                yield batch
+
+        for instances in tqdm(
+            batched(requests),
+            total=(len(requests) + batch_size - 1) // batch_size,
             desc="Generating...",
             disable=disable_tqdm or not self.accelerator.is_main_process,
         ):
-            context, until = instance.args  # type: ignore
+            context, until = map(list, zip(*(instance.args for instance in instances)))
             if self.cfg.generation.get("add_bos_token", False):
-                context = self.tokenizer.bos_token + context
-            context = self.tokenizer(context, return_tensors="pt").input_ids
-            until = until["until"]
+                context = [self.tokenizer.bos_token + ctx for ctx in context]
+            inputs = self.tokenizer(
+                context, return_tensors="pt", padding=True, padding_side="left"
+            )
+            until = [u["until"] for u in until]
             try:
                 with Timer("eval") as timer:
                     decode_record = generate(
                         self.model,
-                        context,
+                        **inputs,
                         **self.cfg.generation,
                         **self.extra_gen_kwargs,
                         tokenizer=self.tokenizer,
@@ -129,25 +148,30 @@ class EvalModelBase(TemplateLM):
                 full_throughput.append(timer.token_per_second(decode_record, False))
                 tps.append(timer.token_per_step(decode_record))
                 full_tps.append(timer.token_per_step(decode_record, False))
-                latency.append(timer.elapsed_time_s)
-                final_frame: Frame = decode_record[-1, 0]
-                is_code_task = "task_id" in instance.doc and str(
-                    instance.doc["task_id"]
+                latency.append(timer.elapsed_time_s / batch_size)
+                final_frame: Frame = decode_record[-1]
+                is_code_task = "task_id" in instances[0].doc and str(
+                    instances[0].doc["task_id"]
                 ).lower().startswith(("humaneval", "mbpp"))
-                generated_answer = decode_final_frame(
-                    self.tokenizer,
-                    final_frame,
-                    stop_words=until if not is_code_task else None,
-                    skip_special_tokens=True,
-                )
-                assert isinstance(
-                    generated_answer, str
-                ), f"Expected generated_answer to be a string, but got {type(generated_answer)}"
-                if is_code_task:
-                    generated_answer = self.postprocess_code(
-                        instance.doc, generated_answer
+                generated_answer = [
+                    cast(
+                        str,
+                        decode_final_frame(
+                            self.tokenizer,
+                            final_frame[i],
+                            stop_words=u if not is_code_task else None,
+                            skip_special_tokens=True,
+                        ),
                     )
-                out.append(generated_answer)
+                    for i, u in enumerate(until)
+                ]
+                if is_code_task:
+                    generated_answer = [
+                        self.postprocess_code(instance.doc, answer)
+                        for instance, answer in zip(instances, generated_answer)
+                    ]
+
+                out.extend(generated_answer)
             except torch.cuda.OutOfMemoryError:
                 out.append("[out-of-memory]")
 
@@ -156,7 +180,7 @@ class EvalModelBase(TemplateLM):
         full_throughput = self.accelerator.gather_for_metrics(full_throughput)
         full_tps = self.accelerator.gather_for_metrics(full_tps)
         latency = self.accelerator.gather_for_metrics(latency)
-        
+
         if self.accelerator.is_main_process:
             self.tps = sum(tps) / len(tps)
             self.throughput = sum(throughput) / len(throughput)

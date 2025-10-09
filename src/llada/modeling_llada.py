@@ -856,13 +856,10 @@ class LLaDALlamaBlock(LLaDABlock):
 
         # create a dummy cache to simplify code
         past_key_values = past_key_values or dCache(self.config)
-        og_x = x
-        x_normed = self.attn_norm(x)
-
         with past_key_values.attention(
             self.layer_id,
-            x_normed,
-            og_x,
+            x,
+            self.attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
@@ -896,11 +893,11 @@ class LLaDALlamaBlock(LLaDABlock):
                 ctx.o, ctx.attn_weight = torch.empty_like(ctx.q), None
 
         q, k, v, o = ctx.q, ctx.k, ctx.v, ctx.o  # keep them for visualization
-        x = ctx.residual + self.dropout(ctx.o)
+        x = ctx.residual  + self.dropout(ctx.o)
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
-        with past_key_values.ffn(self.layer_id, x, x) as ctx:
+        with past_key_values.ffn(self.layer_id, x) as ctx:
             x = self.ff_norm(ctx.x)
             x, x_up = self.ff_proj(x), self.up_proj(x)  # new add
             x = self.act(x)

@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.distributions as dists
+import torch.nn.functional as F
 
 from typing import Type
 
@@ -8,7 +9,7 @@ from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import prepare_logits_for_generation
 from src.dream.generation_utils import top_k_logits, top_p_logits
-from src.utils import register
+from src.utils import certainty_density, register
 from src.third_party import get_token_freq
 
 
@@ -123,9 +124,8 @@ def sample_tokens(
     temperature=0.0,
     top_p=None,
     top_k=None,
-    margin_confidence=False,
-    neg_entropy=False,
     debias=False,
+    alg="maskgit_plus",
 ):
 
     if temperature > 0:
@@ -154,15 +154,14 @@ def sample_tokens(
             -confidence * torch.log(_token_freq[x0] + epsilon), max=10
         )
 
-    if margin_confidence:
+    if alg == "topk_margin":
         sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
         # Extract top1 and top2 probabilities
         top1_probs = sorted_probs[:, 0]
         top2_probs = sorted_probs[:, 1]
         # Calculate confidence as top1 - top2
         confidence = top1_probs - top2_probs
-
-    if neg_entropy:
+    elif alg == "entropy":
         log_probs = torch.log(probs + epsilon)
         confidence = torch.sum(probs * log_probs, dim=-1)
 
@@ -181,6 +180,7 @@ def generate_step(
     temperature: float = 0.0,
     top_p: float | None = None,
     top_k: float | None = None,
+    sigma: float | None = None,
     debias: bool = True,
     mask_token_id: int = None,  # type: ignore
     threshold: float | None = None,
@@ -227,7 +227,8 @@ def generate_step(
             dtype=torch.long,
         )
 
-    transfer_index_mask = frame.generated_tokens == mask_token_id
+    remaining_mask = frame.generated_tokens == mask_token_id
+    transfer_index_mask = remaining_mask.clone()
     can_generate = (block_mask & transfer_index_mask).any(dim=-1)
     if not torch.any(can_generate):
         return None
@@ -250,7 +251,7 @@ def generate_step(
         past_key_values=past_key_values,
         use_cache=past_key_values is not None,
     )
-    # main difference (1) with LLaDA, see https://github.com/DreamLM/Dream/issues/31
+
     logits = prepare_logits_for_generation(model, outputs.logits)
     if past_key_values is not None and past_key_values.active_q_mask is not None:
         if model.config.model_type.lower() == "dream":
@@ -258,9 +259,7 @@ def generate_step(
         else:
             valid_mask = past_key_values.active_q_mask[:, prompt_length:]
         transfer_index_mask &= valid_mask
-    logits = logits[:, prompt_length:][transfer_index_mask].view(
-        batch_size, -1, logits.size(-1)
-    )
+    logits = logits[:, prompt_length:]
 
     hidden_states = (
         tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
@@ -273,39 +272,23 @@ def generate_step(
         _token_freq = get_token_freq(model, device=logits.device, dtype=logits.dtype)
 
     # sampling tokens for all generated positions
-    if alg == "maskgit_plus":
-        # same as LLaDA
-        confidence, x0, p = sample_tokens(
-            logits, temperature=temperature, top_p=top_p, top_k=top_k, debias=debias
-        )
-    elif alg == "topk_margin":
-        # main difference (2) with LLaDA, the confidence may not be the token probabilities
-        confidence, x0, p = sample_tokens(
-            logits,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            margin_confidence=True,
-            debias=debias,
-        )
-    elif alg == "entropy":
-        confidence, x0, p = sample_tokens(
-            logits,
-            temperature,
-            top_p=top_p,
-            top_k=top_k,
-            neg_entropy=True,
-            debias=debias,
-        )
-    else:
-        raise RuntimeError(f"Unknown alg: {alg}")
+    confidence, x0, p = sample_tokens(
+        logits,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        debias=debias,
+        alg=alg,
+    )
+    scores = confidence = torch.where(
+        transfer_index_mask[can_generate], confidence, -torch.inf
+    )
+    if sigma is not None and sigma > 0:
+        scores = confidence * certainty_density(~remaining_mask, sigma=sigma)
 
-    confidence = torch.full_like(
-        frame.generated_tokens, -float("inf"), dtype=confidence.dtype
-    ).masked_scatter_(transfer_index_mask, confidence)
     # select tokens to transfer based on probs and mask
     transfer_index = confidence_unmasking(
-        scores=confidence,
+        scores=scores,
         transfer_index_mask=(transfer_index_mask & block_mask)[can_generate],
         num_transfer_tokens=num_transfer_tokens,
         threshold=threshold,
@@ -323,11 +306,15 @@ def generate_step(
 
     delta = FrameDelta(
         transfer_index=transfer_index,
-        decoded_tokens=torch.full_like(
-            frame.generated_tokens, INVALID_TOKEN_ID
-        ).masked_scatter_(transfer_index_mask, x0),
+        decoded_tokens=torch.where(
+            transfer_index_mask[can_generate], x0, INVALID_TOKEN_ID
+        ),
         confidence=confidence,
-        probs=p if output_probs else None,
+        probs=(
+            torch.where(transfer_index_mask[can_generate], p, -torch.inf)
+            if output_probs
+            else None
+        ),
         intermediate=Intermediate(
             hidden_states=hidden_states if hidden_states is not None else tuple()
         ),
@@ -339,28 +326,29 @@ def generate_step(
 def vanilla_generate(
     model,
     input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
     alg: str = "maskgit_plus",
     steps: int = 128,
     block_length: int = 32,
     gen_length: int = 128,
     temperature: float = 0.0,
-    mask_token_id: int | None = None,
-    pad_token_id: int | None = None,
     top_k: int | None = None,
     top_p: float | None = None,
+    sigma: float | None = None,
+    mask_token_id: int | None = None,
+    pad_token_id: int | None = None,
     debias: bool = False,
     threshold: float | None = None,
     factor: float | None = None,
     output_hidden_states: bool = False,
     output_probs: bool = False,
     cache_cls: Type[dCache] | None = None,
-    tokenizer=None,
 ) -> DecodeRecord:
     """
     Vanilla generation for diffusion large language models.
     Args:
         model: Mask predictor.
-        prompt: A tensor of shape (B, L).
+        input_ids: A tensor of shape (B, prompt_len).
         steps: Sampling steps, less than or equal to gen_length.
         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
         gen_length: Generated answer length.
@@ -368,6 +356,7 @@ def vanilla_generate(
         mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
         top_k: The number of highest probability tokens to keep for one generation step.
         top_p: The cumulative probability threshold for nucleus sampling.
+        sigma: The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
         threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
         factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
         output_hidden_states: Whether to return the hidden states of all decoded tokens from layers.
@@ -391,16 +380,14 @@ def vanilla_generate(
         gen_length=gen_length,
         mask_token_id=mask_token_id,
     ).to(device=model.device, dtype=model.dtype)
-    if pad_token_id is not None:
-        attention_mask = torch.cat(
-            [
-                (input_ids != pad_token_id).long().to(device=model.device),
-                torch.ones(input_ids.size(0), gen_length, device=model.device).long(),
-            ],
-            dim=-1,
+
+    if attention_mask is None and pad_token_id is not None:
+        attention_mask = (input_ids != pad_token_id).long()
+
+    if attention_mask is not None:
+        attention_mask = F.pad(attention_mask, (0, gen_length), value=1).to(
+            model.device
         )
-    else:
-        attention_mask = None
 
     cache = cache_cls(model.config) if cache_cls is not None else None
     frame = initial_frame
@@ -435,9 +422,10 @@ def vanilla_generate(
                 past_key_values=cache,
                 alg=alg,
                 temperature=temperature,
-                mask_token_id=mask_token_id,
                 top_p=top_p,
                 top_k=top_k,
+                sigma=sigma,
+                mask_token_id=mask_token_id,
                 debias=debias,
                 threshold=threshold,
                 factor=factor,

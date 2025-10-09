@@ -11,7 +11,8 @@ from .utils import apply_fn, tensor_insert, tensor_delete
 PLACEHOLDER_STEP = (
     -1
 )  # Represents a placeholder for a token that has not been decoded yet.
-INVALID_TOKEN_ID = -100 # Represents an invalid token ID, used for ignored tokens.
+INVALID_TOKEN_ID = -100  # Represents an invalid token ID, used for ignored tokens.
+
 
 class Base(BaseModel):
 
@@ -503,8 +504,9 @@ class Frame(Base):
         new_frame.generated_tokens[row_indices, col_indices] = torch.cat(delta.transferred_tokens)  # type: ignore
 
         if delta.confidence is not None and new_frame.confidence is not None:
-            active_row_indices = torch.arange(
-                delta.decoded_tokens.size(0), device=device
+            active_row_indices = torch.repeat_interleave(
+                torch.arange(delta.decoded_tokens.size(0), device=device),
+                repeats=lengths[lengths > 0],
             )
             transfer_src_index = (
                 delta.transfer_src_index

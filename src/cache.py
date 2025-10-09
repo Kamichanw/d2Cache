@@ -2,12 +2,14 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import triton
+import triton.language as tl
 
 from dataclasses import dataclass
 from contextlib import contextmanager
 
 from src.frame import Frame, FrameDelta
-from src.utils import certainty_density, nucleus_select
+from src.utils import certainty_density, nucleus_select, pad_mask_
 
 
 @dataclass
@@ -122,7 +124,7 @@ class dCache:
         self,
         layer_idx: int,
         x: torch.Tensor,
-        residual: torch.Tensor,
+        attn_norm: nn.Module,
         q_proj: nn.Linear,
         k_proj: nn.Linear,
         v_proj: nn.Linear,
@@ -137,28 +139,34 @@ class dCache:
         Args:
             layer_idx (int): The index of the layer to update.
             x (torch.Tensor): The input tensor after pre-layer norm, with shape (batch_size, seq_len, d_model).
-            residual (torch.Tensor): The residual of attention, which is obtained before the layer norm.
+            attn_norm (nn.Module): The layer normalization module before attention.
             q_proj (nn.Linear): The query projection layer.
             k_proj (nn.Linear): The key projection layer.
             v_proj (nn.Linear): The value projection layer.
             attention_mask (torch.Tensor, *optional*): An optional attention mask, with shape (batch_size, seq_len, seq_len).
             position_ids (torch.Tensor, *optional*): An optional tensor of position IDs, with shape (batch_size, seq_len).
         """
+        residual = x
+        x = attn_norm(x)
         if x.numel() > 0:
             q, k, v = q_proj(x), k_proj(x), v_proj(x)
         else:
             q, k, v = x[:, 0:0], x[:, 0:0], x[:, 0:0]
+
+        if layer_idx == 0:
+            self._attention_mask = AttentionContext.convert_attention_mask(
+                attention_mask,
+                dtype=q.dtype,
+                query_length=q.shape[1],
+                key_value_length=k.shape[1],
+            )
+
         ctx = AttentionContext(
             q=q,
             k=k,
             v=v,
             residual=residual,
-            attention_mask=AttentionContext.convert_attention_mask(
-                attention_mask,
-                dtype=q.dtype,
-                query_length=q.shape[1],
-                key_value_length=k.shape[1],
-            ),
+            attention_mask=self._attention_mask,
             q_position_ids=position_ids,
             kv_position_ids=position_ids,
         )
@@ -173,7 +181,7 @@ class dCache:
             )
 
     @contextmanager
-    def ffn(self, layer_idx: int, x: torch.Tensor, residual: torch.Tensor):
+    def ffn(self, layer_idx: int, x: torch.Tensor):
         """
         A context manager that modifies the input/output tensors for feed-forward network computation. In this function,
         it should yield a `FFNContext` object that stores `x` and `residual` tensors. The outer code should handle the
@@ -182,9 +190,8 @@ class dCache:
         Args:
             layer_idx (int): The index of the layer to update.
             x (torch.Tensor): The input tensor after self-attention, with shape (batch_size, seq_len, d_model).
-            residual (torch.Tensor): The residual of the feed-forward network, which is obtained before the layer norm.
         """
-        ctx = FFNContext(x=x, residual=residual)
+        ctx = FFNContext(x=x, residual=x)
         yield ctx
 
         if ctx.ffn_out is None:
@@ -197,51 +204,45 @@ class dCache:
                 f"The feed-forward network output shape {ctx.ffn_out.shape!r} is not compatible with the residual shape {ctx.residual.shape!r}."
             )
 
-    def on_step_start(self, block_mask: torch.Tensor | None, frame: Frame):
+    def on_step_start(self, block_mask: torch.Tensor, frame: Frame):
         """
         Called at the start of each generation step to update the cache with the current frame.
 
         Args:
-            block_mask (torch.Tensor | None): A boolean mask indicating which positions in the block are active.
-                It can be None if block semi-autoregressive decoding is not used.
+            block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying the delta.
         """
         ...
 
-    def on_step_end(
-        self, block_mask: torch.Tensor | None, frame: Frame, delta: FrameDelta
-    ):
+    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
         """
         Called at the end of each generation step to update the cache with the current frame and delta.
 
         Args:
-            block_mask (torch.Tensor | None): A boolean mask indicating which positions in the block are active.
-                It can be None if block semi-autoregressive decoding is not used.
+            block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying the delta.
             delta (FrameDelta): The delta to apply to the frame.
         """
         ...
 
-    def on_block_start(self, block_mask: torch.Tensor | None, frame: Frame):
+    def on_block_start(self, block_mask: torch.Tensor, frame: Frame):
         """
         Called at the start of each block to update the cache with the current frame.
 
         Args:
-            block_mask (torch.Tensor | None): A boolean mask indicating which positions in the block are active.
-                It can be None if block semi-autoregressive decoding is not used.
+            block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying any deltas in the block.
         """
         ...
 
     def on_block_end(
-        self, block_mask: torch.Tensor | None, frame: Frame, deltas: list[FrameDelta]
+        self, block_mask: torch.Tensor, frame: Frame, deltas: list[FrameDelta]
     ):
         """
         Called at the end of each block to update the cache with the current frame and deltas.
 
         Args:
-            block_mask (torch.Tensor | None): A boolean mask indicating which positions in the block are active.
-                It can be None if block semi-autoregressive decoding is not used.
+            block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying all deltas in the block.
             deltas (list[FrameDelta]): The list of deltas applied in the block.
         """
@@ -258,7 +259,7 @@ class d2Cache(dCache):
         self,
         model_config,
         rollout_p: float = 0.1,
-        current_k: int = 60,
+        current_k: int = 32,
         sigma: float = 10.0,
     ):
         super().__init__(model_config)
@@ -290,17 +291,22 @@ class d2Cache(dCache):
         self,
         layer_idx: int,
         x: torch.Tensor,
-        residual: torch.Tensor,
+        attn_norm: nn.Module,
         q_proj: nn.Linear,
         k_proj: nn.Linear,
         v_proj: nn.Linear,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ):
-        B, T, C = x.shape
-
         with super().attention(
-            layer_idx, x, residual, q_proj, k_proj, v_proj, attention_mask, position_ids
+            layer_idx,
+            x,
+            attn_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            attention_mask,
+            position_ids,
         ) as ctx:
             if len(self.key_cache) <= layer_idx:
                 # the first forward pass, store states as cache
@@ -311,26 +317,32 @@ class d2Cache(dCache):
                 self.value_cache[layer_idx][self.active_q_mask] = ctx.v
                 ctx.k = self.key_cache[layer_idx]
                 ctx.v = self.value_cache[layer_idx]
-                ctx.q_position_ids, ctx.kv_position_ids = (
+
+            if layer_idx == 0:
+                self._q_position_ids, self._kv_position_ids = (
                     AttentionContext.select_position_ids(
                         position_ids, self.active_q_mask
                     )
                 )
-                B, T, C = ctx.k.shape
+                self._attention_mask = AttentionContext.convert_attention_mask(
+                    attention_mask,
+                    dtype=ctx.k.dtype,
+                    query_length=ctx.q.shape[1],
+                    key_value_length=self.value_cache[layer_idx].shape[1],
+                )
 
-            ctx.attention_mask = AttentionContext.convert_attention_mask(
-                attention_mask,
-                dtype=ctx.k.dtype,
-                query_length=ctx.q.shape[1],
-                key_value_length=self.value_cache[layer_idx].shape[1],
-            )
-
+            ctx.q_position_ids = self._q_position_ids
+            ctx.kv_position_ids = self._kv_position_ids
+            ctx.attention_mask = self._attention_mask
             yield ctx
 
             assert (
                 ctx.attn_weight is not None
             ), 'The attention weights must be outputed, make sure you\'ve set attn_implementation="eager"'
+            B, T, C = self.key_cache[layer_idx].shape
+
             if layer_idx == 0:
+                # shape: (B, pooled_size, pooled_size)
                 self._attn_rollout = torch.eye(
                     T, device=x.device, dtype=x.dtype
                 ).expand(B, -1, -1)
@@ -363,9 +375,7 @@ class d2Cache(dCache):
 
         self._attn_rollout = residual_attn @ self._attn_rollout
 
-    def on_step_end(
-        self, block_mask: torch.Tensor | None, frame: Frame, delta: FrameDelta
-    ):
+    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
         confidence = delta.confidence
         assert confidence is not None
         B, G_old = frame.generated_tokens.shape
@@ -377,7 +387,7 @@ class d2Cache(dCache):
             self._conf_cache = confidence
 
         # prepare active mask for query.
-        # 1. for the positions that are not unmasked, we only calculate those have large score variance
+        # 1. for the masked positions, we only calculate those have large certainty
         # (B, G_old)
         remaining_mask = new_frame.generated_tokens == self.mask_token_id
         if self.active_q_mask is not None:
@@ -389,23 +399,36 @@ class d2Cache(dCache):
                 confidence,
                 self._conf_cache,
             )
-        density = certainty_density(~remaining_mask, self.sigma)
+
+        block_size = block_mask.sum(dim=1, keepdim=True)
+
+        # find the minimal end index that contains at least k candidates.
+        meets_target = torch.cumsum(remaining_mask.int(), dim=1) >= self.current_k
+        min_search_end = torch.argmax(meets_target.int(), dim=1, keepdim=True)
+        min_search_end[~meets_target.any(dim=1, keepdim=True)] = G_old - 1
+
+        # round this minimal end index up to the next block boundary
+        search_end = (((min_search_end // block_size) + 1) * block_size) - 1
+
+        block_start_indices = torch.argmax(block_mask.int(), dim=1, keepdim=True)
+        col_indices = torch.arange(G_old, device=device)
+        search_mask = (col_indices >= block_start_indices) & (col_indices <= search_end)
+
+        scores = self._conf_cache * certainty_density(~remaining_mask, self.sigma)
+
+        # add a bias to tokens in block to ensure at least one token is selected in block
+        scores[block_mask] += scores.max()
         _, indices = torch.topk(
-            torch.where(remaining_mask, self._conf_cache * density, -torch.inf),
+            torch.where(search_mask & remaining_mask, scores, -torch.inf),
             k=min(self.current_k, remaining_mask.size(-1)),
             dim=-1,
         )
-        selected_mask = (
+        response_mask = (
             torch.zeros_like(remaining_mask, dtype=torch.bool).scatter_(
                 1, indices, True
             )
             & remaining_mask
         )
-        # if model is dream, we need to retain the token before masked tokens
-        if self.model_config.model_type.lower() == "dream":
-            response_mask = F.pad(selected_mask[:, 1:], (0, 1), value=False)
-        else:
-            response_mask = selected_mask
         # 2. recompute all new generated tokens, as they transform from mask to real tokens
         transfer_src_index = (
             delta.transfer_src_index
@@ -419,23 +442,41 @@ class d2Cache(dCache):
         col_indices = torch.cat(transfer_src_index)  # type: ignore
         response_mask[row_indices, col_indices] = True
 
-        q_mask = torch.cat(
-            [
-                torch.zeros_like(frame.prompts, dtype=torch.bool),
-                response_mask,
-            ],
-            dim=-1,
-        )
+        q_mask = F.pad(response_mask, (P, 0), value=False)
 
         # 3. for other tokens, select top-k tokens based on attention rollout
         global_importance = self._attn_rollout.sum(dim=1)
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
-        if self.model_config.model_type.lower() == "dream":
-            # if the first mask token is selected, we need to select the token before it
-            # i.e., the last prompt token
-            q_mask[:, P - 1] = selected_mask[:, 0]  # type: ignore
 
-        # TODO: make sure each sequence has the same number of active tokens
+        # 4. pad for batch
+        num_selected_per_seq = q_mask.sum(dim=-1)
+        if torch.any(num_selected_per_seq != num_selected_per_seq.max()):
+            # prioritize selection from masked tokens with higher certainty density.
+            # if all masked tokens have been selected, select from the remaining tokens based on the rollout values.
+            combined_scores = torch.where(q_mask, -torch.inf, global_importance)
+            combined_scores[:, P:] += combined_scores.max() + scores
+
+            pad_mask_(q_mask, int(num_selected_per_seq.max()), combined_scores)
+
+        if self.model_config.model_type.lower() == "dream":
+            # if model is dream, we need to retain the token before masked tokens.
+            # to ensure each sequence has the same number of selected tokens,
+            # we only move the selected positions leftward if the position before it is not selected.
+            selected_mask = q_mask[:, P:] & remaining_mask
+
+            source_rows, source_cols = torch.where(selected_mask)
+
+            source_cols = source_cols + P
+            target_cols = source_cols - 1
+
+            target_is_false_mask = ~q_mask[source_rows, target_cols]
+
+            source_rows = source_rows[target_is_false_mask]
+
+            q_mask[source_rows, source_cols[target_is_false_mask]] = False
+            q_mask[source_rows, target_cols[target_is_false_mask]] = True
+
+        # now, each sequence has the same number of selected tokens
         self.active_q_mask = q_mask
 
 
@@ -466,7 +507,7 @@ class PrefixCache(dCache):
         self,
         layer_idx: int,
         x: torch.Tensor,
-        residual: torch.Tensor,
+        attn_norm: nn.Module,
         q_proj: nn.Linear,
         k_proj: nn.Linear,
         v_proj: nn.Linear,
@@ -474,38 +515,45 @@ class PrefixCache(dCache):
         position_ids: torch.Tensor | None = None,
     ):
         with super().attention(
-            layer_idx, x, residual, q_proj, k_proj, v_proj, attention_mask, position_ids
+            layer_idx,
+            x,
+            attn_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            attention_mask,
+            position_ids,
         ) as ctx:
             if len(self.key_cache) <= layer_idx:
                 # the first forward pass, store states as cache
                 self.key_cache.append(ctx.k)
                 self.value_cache.append(ctx.v)
             else:
-                self.key_cache[layer_idx][self.active_q_mask] = ctx.k
-                self.value_cache[layer_idx][self.active_q_mask] = ctx.v
+                self.key_cache[layer_idx][self.active_q_mask] = ctx.k.flatten(0, 1)
+                self.value_cache[layer_idx][self.active_q_mask] = ctx.v.flatten(0, 1)
                 ctx.k = self.key_cache[layer_idx]
                 ctx.v = self.value_cache[layer_idx]
-                ctx.q_position_ids, ctx.kv_position_ids = (
+
+            if layer_idx == 0:
+                self._q_position_ids, self._kv_position_ids = (
                     AttentionContext.select_position_ids(
                         position_ids, self.active_q_mask
                     )
                 )
+                self._attention_mask = AttentionContext.convert_attention_mask(
+                    attention_mask,
+                    dtype=ctx.k.dtype,
+                    query_length=ctx.q.shape[1],
+                    key_value_length=self.value_cache[layer_idx].shape[1],
+                )
 
-            ctx.attention_mask = AttentionContext.convert_attention_mask(
-                attention_mask,
-                dtype=ctx.k.dtype,
-                query_length=ctx.q.shape[1],
-                key_value_length=self.value_cache[layer_idx].shape[1],
-            )
+            ctx.q_position_ids = self._q_position_ids
+            ctx.kv_position_ids = self._kv_position_ids
+            ctx.attention_mask = self._attention_mask
 
             yield ctx
 
-    def on_step_end(
-        self, block_mask: torch.Tensor | None, frame: Frame, delta: FrameDelta
-    ):
-        assert (
-            block_mask is not None
-        ), "PrefixCache only works with block semi-autoregressive decoding."
+    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
         if self.active_q_mask is None:
             q_mask = torch.cat(
                 [
@@ -515,7 +563,7 @@ class PrefixCache(dCache):
                 dim=-1,
             )
             if not self.use_dual:
-                block_start = int(block_mask[0].int().argmax().item() + 1)
+                block_start = int(block_mask[0].int().argmax() + 1)
                 q_mask[:, frame.prompts.size(-1) + block_start :] = True
 
             if self.model_config.model_type.lower() == "dream":
@@ -523,7 +571,7 @@ class PrefixCache(dCache):
 
             self.active_q_mask = q_mask
 
-    def on_block_start(self, block_mask: torch.Tensor | None, frame: Frame):
+    def on_block_start(self, block_mask: torch.Tensor, frame: Frame):
         self.key_cache: list[torch.Tensor] = []
         self.value_cache: list[torch.Tensor] = []
         self.active_q_mask: torch.Tensor | None = None
@@ -545,7 +593,7 @@ class dLLMCache(dCache):
         self,
         layer_idx: int,
         x: torch.Tensor,
-        residual: torch.Tensor,
+        attn_norm: nn.Module,
         q_proj: nn.Linear,
         k_proj: nn.Linear,
         v_proj: nn.Linear,
@@ -554,6 +602,8 @@ class dLLMCache(dCache):
     ):
         refresh_prompt = self.refresh_prompt or layer_idx == 0
         refresh_response = self.refresh_response or layer_idx == 0
+        residual = x
+        x = attn_norm(x)
         # select prompt or/and response part to feed into the projections
         x_prompt = x[:, : self._prompt_length]
         x_response = x[:, self._prompt_length :]
@@ -695,9 +745,10 @@ class dLLMCache(dCache):
         ctx.o = self.attn_cache[layer_idx]
 
     @contextmanager
-    def ffn(self, layer_idx: int, x: torch.Tensor, residual: torch.Tensor):
+    def ffn(self, layer_idx: int, x: torch.Tensor):
         B, _, C = x.shape
         row_indices = torch.arange(B).unsqueeze(-1).expand_as(self._refresh_index)
+        residual = x
         x = x[row_indices, self._refresh_index]
         ctx = FFNContext(x=x, residual=residual)
 
@@ -712,7 +763,7 @@ class dLLMCache(dCache):
             )
         ctx.ffn_out = self.ffn_cache[layer_idx]
 
-    def on_step_start(self, block_mask: torch.Tensor | None, frame: Frame):
+    def on_step_start(self, block_mask: torch.Tensor, frame: Frame):
         current_steps = frame.steps.max(-1, keepdim=True).values
         can_generate = torch.sum(
             frame.generated_tokens == self.mask_token_id, dim=-1, keepdim=True

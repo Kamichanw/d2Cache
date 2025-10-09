@@ -1,11 +1,6 @@
 #!/bin/bash
 # This script runs evaluation for a dataset
 
-DATASET="math-500"
-MODEL="llada-inst"
-OUTPUT_DIR="./outputs/${MODEL}-${DATASET}"
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
-
 # 1. Test vanilla decoding on GSM8K with LLaDA-7B-Instruct, run:
 
 accelerate launch \
@@ -44,8 +39,21 @@ accelerate launch \
     generation=vanilla \
     model=dream-inst
 
-# 4. Test d2Cache on MBPP with Dream-v0-Base-7B, run:
+# 4.1 Test d2Cache on MBPP with Dream-v0-Base-7B, run:
+# certainty prior guided decoding is enabled by default when using d2Cache
+accelerate launch \
+    --num_machines 1 \
+    --num_processes 4 \
+    eval.py \
+    dataset.name=humaneval \
+    batch_size=1 \
+    seed=1234 \
+    cache=d2cache \
+    generation=vanilla \
+    model=llada-inst
 
+# 4.2 d2Cache is also compatible with vanilla decoding and parallel decoding, run:
+# explicitly set sigma to null to disable certainty prior guided decoding
 accelerate launch \
     --num_machines 1 \
     --num_processes 4 \
@@ -54,5 +62,7 @@ accelerate launch \
     batch_size=1 \
     seed=1234 \
     cache=d2cache \
-    generation=dyna \
+    generation=vanilla \
+    generation.threshold=0.9 \
+    generation.sigma=null \
     model=dream-base

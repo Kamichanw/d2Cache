@@ -301,7 +301,7 @@ class DreamAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+        attn_norm: nn.Module,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[dCache] = None,
@@ -319,7 +319,7 @@ class DreamAttention(nn.Module):
         with past_key_values.attention(
             self.layer_idx,
             hidden_states,
-            residual,
+            attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
@@ -331,8 +331,7 @@ class DreamAttention(nn.Module):
                 or ctx.q_position_ids.shape != ctx.q.shape[:2]
             )
             kv_mismatch = (
-                ctx.k.shape != hidden_states.shape
-                or ctx.v.shape != hidden_states.shape
+                ctx.k.shape != hidden_states.shape or ctx.v.shape != hidden_states.shape
             ) and (
                 ctx.kv_position_ids is None
                 or ctx.kv_position_ids.shape != ctx.k.shape[:2]
@@ -344,12 +343,12 @@ class DreamAttention(nn.Module):
                 )
 
             q = ctx.q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            k = ctx.k.view(
-                bsz, -1, self.num_key_value_heads, self.head_dim
-            ).transpose(1, 2)
-            v = ctx.v.view(
-                bsz, -1, self.num_key_value_heads, self.head_dim
-            ).transpose(1, 2)
+            k = ctx.k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+            v = ctx.v.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
 
             cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
             k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
@@ -360,12 +359,8 @@ class DreamAttention(nn.Module):
             k = repeat_kv(k, self.num_key_value_groups)
             v = repeat_kv(v, self.num_key_value_groups)
 
-            attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(
-                self.head_dim
-            )
-            if (
-                ctx.attention_mask is not None
-            ):  # no matter the length, we just slice it
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if ctx.attention_mask is not None:  # no matter the length, we just slice it
                 causal_mask = ctx.attention_mask[:, :, :, : k.shape[-2]]
                 attn_weights = attn_weights + causal_mask
 
@@ -402,7 +397,7 @@ class DreamSdpaAttention(DreamAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+        attn_norm: nn.Module,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[dCache] = None,
@@ -421,7 +416,7 @@ class DreamSdpaAttention(DreamAttention):
             )
             return super().forward(
                 hidden_states=hidden_states,
-                residual=residual,
+                attn_norm=attn_norm,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -436,7 +431,7 @@ class DreamSdpaAttention(DreamAttention):
         with past_key_values.attention(
             self.layer_idx,
             hidden_states,
-            residual,
+            attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
@@ -448,8 +443,7 @@ class DreamSdpaAttention(DreamAttention):
                 or ctx.q_position_ids.shape != ctx.q.shape[:2]
             )
             kv_mismatch = (
-                ctx.k.shape != hidden_states.shape
-                or ctx.v.shape != hidden_states.shape
+                ctx.k.shape != hidden_states.shape or ctx.v.shape != hidden_states.shape
             ) and (
                 ctx.kv_position_ids is None
                 or ctx.kv_position_ids.shape != ctx.k.shape[:2]
@@ -461,12 +455,12 @@ class DreamSdpaAttention(DreamAttention):
                 )
 
             q = ctx.q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            k = ctx.k.view(
-                bsz, -1, self.num_key_value_heads, self.head_dim
-            ).transpose(1, 2)
-            v = ctx.v.view(
-                bsz, -1, self.num_key_value_heads, self.head_dim
-            ).transpose(1, 2)
+            k = ctx.k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+            v = ctx.v.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
 
             cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
             k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
@@ -497,9 +491,7 @@ class DreamSdpaAttention(DreamAttention):
                 k,
                 v,
                 attn_mask=(
-                    attention_mask
-                    if isinstance(attention_mask, torch.Tensor)
-                    else None
+                    attention_mask if isinstance(attention_mask, torch.Tensor) else None
                 ),
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=False,  # hard coded
@@ -580,13 +572,10 @@ class DreamDecoderLayer(nn.Module):
         # create a dummy cache to simplify code
         past_key_values = past_key_values or dCache(self.config)
 
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
         hidden_states, self_attn_weights, residual = self.self_attn(
             hidden_states=hidden_states,
-            residual=residual,
+            attn_norm=self.input_layernorm,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -599,11 +588,7 @@ class DreamDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        with past_key_values.ffn(
-            self.layer_idx,
-            hidden_states,
-            hidden_states,
-        ) as ctx:
+        with past_key_values.ffn(self.layer_idx, hidden_states) as ctx:
             hidden_states = self.post_attention_layernorm(ctx.x)
             hidden_states = self.mlp(hidden_states)
             ctx.ffn_out = hidden_states
