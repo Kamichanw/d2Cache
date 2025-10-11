@@ -69,11 +69,12 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
                 "rollout_p": 0.1,
                 "current_k": 32,
                 "sigma": sigma,
+                "inflate_w": 0,
             }
             # when using certainty prior (CP) guided decoding, block-wise semi-ar is no longer needed.
             block_length = gen_length
             # but it is also possible to use CP guided decoding and block-wise semi-ar.
-            # to achieve this, pass `generation.block_length=32` in cli
+            # to achieve this, pass `generation.block_length=32 cache.inflate_w=4` in cli
         case "prefix":
             block_length = 32
         case "dllm":

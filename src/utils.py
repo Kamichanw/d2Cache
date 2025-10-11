@@ -526,7 +526,7 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
         logger.info(
             f"Downloading antlr4-python3-runtime=={target_version} to {temp_dir}..."
         )
-        subprocess.run(
+        result = subprocess.run(
             [
                 sys.executable,
                 "-m",
@@ -536,16 +536,18 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
                 "--no-deps",
                 "-d",
                 temp_dir,
+                "-i",
+                "https://pypi.tuna.tsinghua.edu.cn/simple"
             ],
-            check=True,
             capture_output=True,
             text=True,
         )
 
         wheel_files = list(temp_dir_path.glob("*.whl"))
-        if not wheel_files:
+        if not wheel_files or result.returncode != 0:
             raise RuntimeError(
                 f"Failed to download antlr4-python3-runtime=={target_version}"
+                f" (return code: {result.returncode}): {result.stderr}"
             )
 
         logger.info(f"Unpacking {wheel_files[0].name}...")

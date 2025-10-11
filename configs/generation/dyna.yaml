@@ -1,5 +1,0 @@
-defaults:
-  - vanilla
-  - _self_
-  
-strategy: dyna

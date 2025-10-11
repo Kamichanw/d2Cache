@@ -63,4 +63,4 @@ If you find d²Cache useful for your research and applications, please cite usin
 }
 ```
 # Acknowledgment
-We would like to thank the authors of [LLaDA](https://github.com/llada-project/llada) and [Dream](https://github.com/dream-project/dream) for their excellent work and open-source contributions. The concurrent KV cache of dLLMs, [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM) and [dLLM-Cache](https://github.com/maomaocun/dLLM-cache) also give us much inspiration.
+We would like to thank the authors of [LLaDA](https://github.com/llada-project/llada) and [Dream](https://github.com/DreamLM/Dream) for their excellent work and open-source contributions. The concurrent KV cache of dLLMs, [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM) and [dLLM-Cache](https://github.com/maomaocun/dLLM-cache) also give us much inspiration.

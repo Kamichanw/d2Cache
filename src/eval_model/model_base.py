@@ -141,7 +141,7 @@ class EvalModelBase(TemplateLM):
                         **inputs,
                         **self.cfg.generation,
                         **self.extra_gen_kwargs,
-                        tokenizer=self.tokenizer,
+                        ignore_unknown_args="ignore",
                     )
 
                 throughput.append(timer.token_per_second(decode_record))

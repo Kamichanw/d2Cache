@@ -261,6 +261,7 @@ class d2Cache(dCache):
         rollout_p: float = 0.1,
         current_k: int = 32,
         sigma: float = 10.0,
+        inflate_w: int = 8,
     ):
         super().__init__(model_config)
         self.key_cache: list[torch.Tensor] = []
@@ -269,6 +270,7 @@ class d2Cache(dCache):
         self.rollout_p = rollout_p
         self.current_k = current_k
         self.sigma = sigma
+        self.inflate_w = inflate_w
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
@@ -380,6 +382,7 @@ class d2Cache(dCache):
         assert confidence is not None
         B, G_old = frame.generated_tokens.shape
         B, P = frame.prompts.shape
+        T = G_old + P
         new_frame = frame.apply_delta(delta)
         device = confidence.device
 
@@ -448,7 +451,32 @@ class d2Cache(dCache):
         global_importance = self._attn_rollout.sum(dim=1)
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
 
-        # 4. pad for batch
+        # 4. inflate the mask: if two selected tokens are within a window, select all tokens between them.
+        if self.inflate_w > 0:
+            arange_t = torch.arange(T, device=device).expand(B, -1)
+
+            # find distance to the next selected token for each position
+            masked_indices_next = torch.where(q_mask, arange_t, T)
+            next_selected_indices = torch.cummin(
+                torch.flip(masked_indices_next, dims=[-1]), dim=-1
+            ).values
+            next_selected_indices = torch.flip(next_selected_indices, dims=[-1])
+            dist_to_next_true = next_selected_indices - arange_t
+
+            # find distance to the previous selected token for each position
+            masked_indices_prev = torch.where(q_mask, arange_t, -1)
+            prev_selected_indices = torch.cummax(masked_indices_prev, dim=-1).values
+            dist_to_prev_true = arange_t - prev_selected_indices
+
+            # inflate if the gap is smaller than or equal to the window size.
+            gap_len = dist_to_next_true + dist_to_prev_true
+            q_mask |= (
+                (gap_len <= self.inflate_w)
+                & (prev_selected_indices >= 0)
+                & (next_selected_indices < T)
+            )
+
+        # 5. pad for batch
         num_selected_per_seq = q_mask.sum(dim=-1)
         if torch.any(num_selected_per_seq != num_selected_per_seq.max()):
             # prioritize selection from masked tokens with higher certainty density.
