@@ -1172,16 +1172,6 @@ class LLaDAModel(nn.Module):
         # shape: (batch_size, seq_len, d_model)
         x = self.transformer.emb_drop(x)  # type: ignore
 
-        # Transform the attention mask into what the blocks expect.
-        if attention_mask is not None and 0.0 in attention_mask:
-            # shape: (batch_size, 1, 1, seq_len)
-            attention_mask = attention_mask.to(dtype=torch.float).view(batch_size, -1)[
-                :, None, None, :
-            ]
-            attention_mask = (1.0 - attention_mask) * torch.finfo(
-                attention_mask.dtype
-            ).min
-
         # decoder layers
         all_hidden_states = []
 

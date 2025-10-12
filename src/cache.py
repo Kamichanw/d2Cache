@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 
 from src.frame import Frame, FrameDelta
-from src.utils import certainty_density, nucleus_select, pad_mask_
+from src.utils import certainty_density, nucleus_select, top_up_mask_
 
 
 @dataclass
@@ -95,6 +95,22 @@ class dCache:
     def __init__(self, model_config):
         self.model_config = model_config
         self.active_q_mask: torch.Tensor | None = None
+
+        self._active_seq_mask: torch.Tensor | None = None
+
+    @property
+    def active_seq_mask(self):
+        """
+        A boolean tensor indicates which sequences can generate new tokens in current step.
+        It should be assigned outside the cache before model forward.
+        """
+        if self._active_seq_mask is None:
+            raise RuntimeError("The active_seq_mask is not set.")
+        return self._active_seq_mask
+
+    @active_seq_mask.setter
+    def active_seq_mask(self, mask: torch.Tensor):
+        self._active_seq_mask = mask
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
@@ -266,7 +282,11 @@ class d2Cache(dCache):
         super().__init__(model_config)
         self.key_cache: list[torch.Tensor] = []
         self.value_cache: list[torch.Tensor] = []
-        self._conf_cache: torch.Tensor | None = None
+        self._conf_cache: torch.Tensor | None = None  # shape (B, G)
+        self._full_q_mask: torch.Tensor | None = None  # shape (B, T)
+        self._full_remaining_mask: torch.Tensor  # shape (B, G)
+        self._density_score: torch.Tensor  # shape (B_active, G)
+        self._global_importance: torch.Tensor  # shape (B_active, T)
         self.rollout_p = rollout_p
         self.current_k = current_k
         self.sigma = sigma
@@ -276,12 +296,16 @@ class d2Cache(dCache):
     def model_forward(self, x: torch.Tensor):
         with super().model_forward(x=x) as ctx:
             B, T, C = x.shape
-            if self.active_q_mask is not None:
+            if self._full_q_mask is not None:
+                self.active_q_mask = self.shift_mask_(
+                    self.top_up_mask(self._full_q_mask[self.active_seq_mask]),
+                    self._full_remaining_mask[self.active_seq_mask],
+                )
                 ctx.x = x[self.active_q_mask].view(B, -1, C)
             yield ctx
 
-            if self.active_q_mask is not None:
-                assert ctx.logits is not None
+            if self._full_q_mask is not None:
+                assert ctx.logits is not None and self.active_q_mask is not None
                 ctx.logits = torch.zeros(
                     (B, T, ctx.logits.size(-1)),
                     dtype=ctx.logits.dtype,
@@ -315,10 +339,21 @@ class d2Cache(dCache):
                 self.key_cache.append(ctx.k)
                 self.value_cache.append(ctx.v)
             else:
-                self.key_cache[layer_idx][self.active_q_mask] = ctx.k
-                self.value_cache[layer_idx][self.active_q_mask] = ctx.v
-                ctx.k = self.key_cache[layer_idx]
-                ctx.v = self.value_cache[layer_idx]
+                assert self.active_q_mask is not None
+                if layer_idx == 0:
+                    active_seq_idx = torch.where(self.active_seq_mask)[0]
+                    m_nonzero = self.active_q_mask.nonzero(as_tuple=False)
+                    self._active_q_indices = (
+                        active_seq_idx[m_nonzero[:, 0]],
+                        m_nonzero[:, 1],
+                    )
+
+                self.key_cache[layer_idx][self._active_q_indices] = ctx.k.flatten(0, 1)
+                self.value_cache[layer_idx][self._active_q_indices] = ctx.v.flatten(
+                    0, 1
+                )
+                ctx.k = self.key_cache[layer_idx][self.active_seq_mask]
+                ctx.v = self.value_cache[layer_idx][self.active_seq_mask]
 
             if layer_idx == 0:
                 self._q_position_ids, self._kv_position_ids = (
@@ -351,6 +386,43 @@ class d2Cache(dCache):
 
             self.accumulate_attn_rollout(ctx.attn_weight)
 
+    def shift_mask_(self, q_mask: torch.Tensor, remaining_mask: torch.Tensor):
+        """
+        If model is dream, we need to retain the token before masked tokens.
+        To ensure each sequence has the same number of selected tokens, we only move the selected positions leftward
+        if the position before it is not selected.
+        """
+        if self.model_config.model_type.lower() == "dream":
+            B, T = q_mask.shape
+            P = T - remaining_mask.size(-1)
+            selected_mask = q_mask[:, P:] & remaining_mask
+
+            source_rows, source_cols = torch.where(selected_mask)
+
+            source_cols = source_cols + P
+            target_cols = source_cols - 1
+
+            target_is_false_mask = ~q_mask[source_rows, target_cols]
+
+            source_rows = source_rows[target_is_false_mask]
+
+            q_mask[source_rows, source_cols[target_is_false_mask]] = False
+            q_mask[source_rows, target_cols[target_is_false_mask]] = True
+        return q_mask
+
+    def top_up_mask(self, q_mask: torch.Tensor):
+        q_mask = q_mask.clone()
+        num_selected_per_seq = q_mask.sum(dim=-1)
+        _, G = self._density_score.shape
+        if torch.any(num_selected_per_seq != num_selected_per_seq.max()):
+            # prioritize selection from masked tokens with higher certainty density.
+            # if all masked tokens have been selected, select from the remaining tokens based on the rollout values.
+            combined_scores = torch.where(q_mask, -torch.inf, self._global_importance)
+            combined_scores[:, -G:] += combined_scores.max() + self._density_score
+
+            top_up_mask_(q_mask, int(num_selected_per_seq.max()), combined_scores)
+        return q_mask
+
     def accumulate_attn_rollout(self, attn_scores: torch.Tensor):
         """
         Computes one step of the Attention Rollout for attention maps.
@@ -364,12 +436,15 @@ class d2Cache(dCache):
         device, dtype = attn_scores.device, attn_scores.dtype
 
         # inject the rectangular attention map into the rows
-        effective_attn = torch.eye(seq_len, device=device, dtype=dtype).expand(
-            B, -1, -1
-        )
-        effective_attn[self.active_q_mask] = attn_scores.mean(dim=1).reshape(
-            -1, seq_len
-        )
+        if self.active_q_mask is None:
+            effective_attn = attn_scores.mean(dim=1)
+        else:
+            effective_attn = torch.eye(seq_len, device=device, dtype=dtype).repeat(
+                B, 1, 1
+            )
+            effective_attn[self.active_q_mask] = attn_scores.mean(dim=1).reshape(
+                -1, seq_len
+            )
 
         residual_attn = effective_attn + torch.eye(seq_len, device=device, dtype=dtype)
         # re-normalize the matrix so that each row sums to 1
@@ -380,9 +455,10 @@ class d2Cache(dCache):
     def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
         confidence = delta.confidence
         assert confidence is not None
-        B, G_old = frame.generated_tokens.shape
         B, P = frame.prompts.shape
-        T = G_old + P
+        B_active, G = confidence.shape
+        T = G + P
+        block_mask = block_mask[self.active_seq_mask]
         new_frame = frame.apply_delta(delta)
         device = confidence.device
 
@@ -391,33 +467,36 @@ class d2Cache(dCache):
 
         # prepare active mask for query.
         # 1. for the masked positions, we only calculate those have large certainty
-        # (B, G_old)
-        remaining_mask = new_frame.generated_tokens == self.mask_token_id
+        # (B_active, G)
+        remaining_mask = (
+            new_frame.generated_tokens[self.active_seq_mask] == self.mask_token_id
+        )
         if self.active_q_mask is not None:
             # only position where are selected at previous step and are still masked
             # can produce valid confidence scores
-            self._conf_cache = torch.where(
-                self.active_q_mask[:, P:] & frame.generated_tokens
-                == self.mask_token_id,
-                confidence,
-                self._conf_cache,
+            valid_mask = (
+                self.active_q_mask[:, P:] & frame.generated_tokens[self.active_seq_mask]
+                == self.mask_token_id
             )
+            self._conf_cache[self.active_seq_mask][valid_mask] = confidence[valid_mask]
 
         block_size = block_mask.sum(dim=1, keepdim=True)
 
         # find the minimal end index that contains at least k candidates.
         meets_target = torch.cumsum(remaining_mask.int(), dim=1) >= self.current_k
         min_search_end = torch.argmax(meets_target.int(), dim=1, keepdim=True)
-        min_search_end[~meets_target.any(dim=1, keepdim=True)] = G_old - 1
+        min_search_end[~meets_target.any(dim=1, keepdim=True)] = G - 1
 
         # round this minimal end index up to the next block boundary
         search_end = (((min_search_end // block_size) + 1) * block_size) - 1
 
         block_start_indices = torch.argmax(block_mask.int(), dim=1, keepdim=True)
-        col_indices = torch.arange(G_old, device=device)
+        col_indices = torch.arange(G, device=device)
         search_mask = (col_indices >= block_start_indices) & (col_indices <= search_end)
 
-        scores = self._conf_cache * certainty_density(~remaining_mask, self.sigma)
+        scores = self._conf_cache[self.active_seq_mask] * certainty_density(
+            ~remaining_mask, self.sigma
+        )
 
         # add a bias to tokens in block to ensure at least one token is selected in block
         scores[block_mask] += scores.max()
@@ -438,9 +517,11 @@ class d2Cache(dCache):
             if delta.transfer_src_index is not None
             else delta.transfer_index
         )
-        lengths = torch.tensor([ti.numel() for ti in transfer_src_index], device=device)
+        lengths = torch.tensor(
+            [ti.numel() for ti in transfer_src_index if ti.numel() > 0], device=device
+        )
         row_indices = torch.repeat_interleave(
-            torch.arange(B, device=confidence.device), lengths
+            torch.arange(B_active, device=confidence.device), lengths
         )
         col_indices = torch.cat(transfer_src_index)  # type: ignore
         response_mask[row_indices, col_indices] = True
@@ -448,12 +529,12 @@ class d2Cache(dCache):
         q_mask = F.pad(response_mask, (P, 0), value=False)
 
         # 3. for other tokens, select top-k tokens based on attention rollout
-        global_importance = self._attn_rollout.sum(dim=1)
+        global_importance = self._attn_rollout.sum(dim=1)[self.active_seq_mask]
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
 
         # 4. inflate the mask: if two selected tokens are within a window, select all tokens between them.
         if self.inflate_w > 0:
-            arange_t = torch.arange(T, device=device).expand(B, -1)
+            arange_t = torch.arange(T, device=device).expand(B_active, -1)
 
             # find distance to the next selected token for each position
             masked_indices_next = torch.where(q_mask, arange_t, T)
@@ -476,36 +557,14 @@ class d2Cache(dCache):
                 & (next_selected_indices < T)
             )
 
-        # 5. pad for batch
-        num_selected_per_seq = q_mask.sum(dim=-1)
-        if torch.any(num_selected_per_seq != num_selected_per_seq.max()):
-            # prioritize selection from masked tokens with higher certainty density.
-            # if all masked tokens have been selected, select from the remaining tokens based on the rollout values.
-            combined_scores = torch.where(q_mask, -torch.inf, global_importance)
-            combined_scores[:, P:] += combined_scores.max() + scores
-
-            pad_mask_(q_mask, int(num_selected_per_seq.max()), combined_scores)
-
-        if self.model_config.model_type.lower() == "dream":
-            # if model is dream, we need to retain the token before masked tokens.
-            # to ensure each sequence has the same number of selected tokens,
-            # we only move the selected positions leftward if the position before it is not selected.
-            selected_mask = q_mask[:, P:] & remaining_mask
-
-            source_rows, source_cols = torch.where(selected_mask)
-
-            source_cols = source_cols + P
-            target_cols = source_cols - 1
-
-            target_is_false_mask = ~q_mask[source_rows, target_cols]
-
-            source_rows = source_rows[target_is_false_mask]
-
-            q_mask[source_rows, source_cols[target_is_false_mask]] = False
-            q_mask[source_rows, target_cols[target_is_false_mask]] = True
-
-        # now, each sequence has the same number of selected tokens
-        self.active_q_mask = q_mask
+        if self._full_q_mask is None:
+            self._full_q_mask = q_mask
+            self._full_remaining_mask = remaining_mask
+        else:
+            self._full_q_mask[self.active_seq_mask] = q_mask
+            self._full_remaining_mask[self.active_seq_mask] = remaining_mask
+        self._global_importance = global_importance
+        self._density_score = scores
 
 
 class PrefixCache(dCache):
@@ -519,6 +578,10 @@ class PrefixCache(dCache):
         with super().model_forward(x=x) as ctx:
             B, T, C = x.shape
             if self.active_q_mask is not None:
+                if B != self.active_q_mask.size(0):
+                    # if some sequences in the batch have ended, we need to resize
+                    # the active_q_mask accordingly.
+                    self.active_q_mask = self.active_q_mask[0].expand(B, -1)
                 ctx.x = x[self.active_q_mask].view(B, -1, C)
             yield ctx
 
@@ -557,10 +620,21 @@ class PrefixCache(dCache):
                 self.key_cache.append(ctx.k)
                 self.value_cache.append(ctx.v)
             else:
-                self.key_cache[layer_idx][self.active_q_mask] = ctx.k.flatten(0, 1)
-                self.value_cache[layer_idx][self.active_q_mask] = ctx.v.flatten(0, 1)
-                ctx.k = self.key_cache[layer_idx]
-                ctx.v = self.value_cache[layer_idx]
+                assert self.active_q_mask is not None
+                if layer_idx == 0:
+                    active_seq_idx = torch.where(self.active_seq_mask)[0]
+                    m_nonzero = self.active_q_mask.nonzero(as_tuple=False)
+                    self._active_q_indices = (
+                        active_seq_idx[m_nonzero[:, 0]],
+                        m_nonzero[:, 1],
+                    )
+
+                self.key_cache[layer_idx][self._active_q_indices] = ctx.k.flatten(0, 1)
+                self.value_cache[layer_idx][self._active_q_indices] = ctx.v.flatten(
+                    0, 1
+                )
+                ctx.k = self.key_cache[layer_idx][self.active_seq_mask]
+                ctx.v = self.value_cache[layer_idx][self.active_seq_mask]
 
             if layer_idx == 0:
                 self._q_position_ids, self._kv_position_ids = (
@@ -583,13 +657,7 @@ class PrefixCache(dCache):
 
     def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
         if self.active_q_mask is None:
-            q_mask = torch.cat(
-                [
-                    torch.zeros_like(frame.prompts, dtype=torch.bool),
-                    block_mask,
-                ],
-                dim=-1,
-            )
+            q_mask = F.pad(block_mask, (frame.prompts.size(-1), 0), value=False)
             if not self.use_dual:
                 block_start = int(block_mask[0].int().argmax() + 1)
                 q_mask[:, frame.prompts.size(-1) + block_start :] = True

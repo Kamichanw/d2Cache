@@ -235,6 +235,9 @@ def generate_step(
     # skip sequence that doesn't require to generate
     can_generate &= num_transfer_tokens > 0
 
+    if past_key_values is not None:
+        past_key_values.active_seq_mask = can_generate
+
     x = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)[can_generate]
     attention_mask = (
         attention_mask[can_generate] if attention_mask is not None else None

@@ -451,7 +451,7 @@ def nucleus_select(
     )
 
 
-def pad_mask_(
+def top_up_mask_(
     mask: torch.Tensor, target_count: int, scores: torch.Tensor
 ) -> torch.Tensor:
     """
@@ -537,7 +537,7 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
                 "-d",
                 temp_dir,
                 "-i",
-                "https://pypi.tuna.tsinghua.edu.cn/simple"
+                "https://pypi.tuna.tsinghua.edu.cn/simple",
             ],
             capture_output=True,
             text=True,

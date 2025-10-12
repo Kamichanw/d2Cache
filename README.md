@@ -9,7 +9,9 @@
 **Dual aDaptive Cache (d²Cache)** is a novel, training-free framework that accelerates inference for diffusion-based large language models (dLLMs) while also improving generation quality. It achieves substantial speedups and consistent quality gains over standard decoding and previsou proposed KV cache methods on various representative dLLMs.
 
  # News
-[25/8/30] We released [code reading guides](./docs/code_reading_guides.md), hoping this can help you to grasp our work :)
+[25/9/30] We released [code reading guides](./docs/code_reading_guides.md), hoping this can help you to grasp our work :)
+
+[25/10/13] Now, batch inference is supported!
 # Setup
 ```bash
 # Create and activate the environment
@@ -48,9 +50,6 @@ Available cache methods:
 
 
 Additional general arguments can be specified in `configs/geneation/*.yaml` or `configs/gen_args.py`.
-
-> [!NOTE]
-> Batch inference is partially supported and not well tested. If you need this feature, feel free to open an issue or a PR directly!
 
 # Citation
 If you find d²Cache useful for your research and applications, please cite using this BibTeX:
