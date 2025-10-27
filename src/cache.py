@@ -285,8 +285,8 @@ class d2Cache(dCache):
         self._conf_cache: torch.Tensor | None = None  # shape (B, G)
         self._full_q_mask: torch.Tensor | None = None  # shape (B, T)
         self._full_remaining_mask: torch.Tensor  # shape (B, G)
-        self._density_score: torch.Tensor  # shape (B_active, G)
-        self._global_importance: torch.Tensor  # shape (B_active, T)
+        self._density_score: torch.Tensor  # shape (B, G)
+        self._global_importance: torch.Tensor  # shape (B, T)
         self.rollout_p = rollout_p
         self.current_k = current_k
         self.sigma = sigma
@@ -376,13 +376,12 @@ class d2Cache(dCache):
             assert (
                 ctx.attn_weight is not None
             ), 'The attention weights must be outputed, make sure you\'ve set attn_implementation="eager"'
-            B, T, C = self.key_cache[layer_idx].shape
 
             if layer_idx == 0:
                 # shape: (B, pooled_size, pooled_size)
                 self._attn_rollout = torch.eye(
-                    T, device=x.device, dtype=x.dtype
-                ).expand(B, -1, -1)
+                    self.key_cache[layer_idx].size(1), device=x.device, dtype=x.dtype
+                ).expand(x.size(0), -1, -1)
 
             self.accumulate_attn_rollout(ctx.attn_weight)
 
@@ -417,8 +416,12 @@ class d2Cache(dCache):
         if torch.any(num_selected_per_seq != num_selected_per_seq.max()):
             # prioritize selection from masked tokens with higher certainty density.
             # if all masked tokens have been selected, select from the remaining tokens based on the rollout values.
-            combined_scores = torch.where(q_mask, -torch.inf, self._global_importance)
-            combined_scores[:, -G:] += combined_scores.max() + self._density_score
+            combined_scores = torch.where(
+                q_mask, -torch.inf, self._global_importance[self.active_seq_mask]
+            )
+            combined_scores[:, -G:] += (
+                combined_scores.max() + self._density_score[self.active_seq_mask]
+            )
 
             top_up_mask_(q_mask, int(num_selected_per_seq.max()), combined_scores)
         return q_mask
@@ -529,7 +532,7 @@ class d2Cache(dCache):
         q_mask = F.pad(response_mask, (P, 0), value=False)
 
         # 3. for other tokens, select top-k tokens based on attention rollout
-        global_importance = self._attn_rollout.sum(dim=1)[self.active_seq_mask]
+        global_importance = self._attn_rollout.sum(dim=1)
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
 
         # 4. inflate the mask: if two selected tokens are within a window, select all tokens between them.
@@ -560,11 +563,13 @@ class d2Cache(dCache):
         if self._full_q_mask is None:
             self._full_q_mask = q_mask
             self._full_remaining_mask = remaining_mask
+            self._global_importance = global_importance
+            self._density_score = scores
         else:
             self._full_q_mask[self.active_seq_mask] = q_mask
             self._full_remaining_mask[self.active_seq_mask] = remaining_mask
-        self._global_importance = global_importance
-        self._density_score = scores
+            self._global_importance[self.active_seq_mask] = global_importance
+            self._density_score[self.active_seq_mask] = scores
 
 
 class PrefixCache(dCache):

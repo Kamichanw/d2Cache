@@ -491,7 +491,9 @@ class DreamSdpaAttention(DreamAttention):
                 k,
                 v,
                 attn_mask=(
-                    attention_mask if isinstance(attention_mask, torch.Tensor) else None
+                    ctx.attention_mask
+                    if isinstance(ctx.attention_mask, torch.Tensor)
+                    else None
                 ),
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=False,  # hard coded

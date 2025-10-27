@@ -261,7 +261,7 @@ def generate_step(
             valid_mask = past_key_values.active_q_mask[:, prompt_length - 1 : -1]
         else:
             valid_mask = past_key_values.active_q_mask[:, prompt_length:]
-        transfer_index_mask &= valid_mask
+        transfer_index_mask[can_generate].logical_and_(valid_mask)
     logits = logits[:, prompt_length:]
 
     hidden_states = (

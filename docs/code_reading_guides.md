@@ -14,7 +14,6 @@ The implementations of the generation methods are located in the `src/generation
 
 - `src/generation/vanilla.py` provides the standard decoding process for both LLaDA and Dream. This implementation also incorporates optimizations such as parallel decoding, as proposed in [Fast dLLM](https://arxiv.org/abs/2505.22618), and trivial token debiasing from [PC-Sampler](https://arxiv.org/abs/2508.13021).
 
-- `src/generation/dyna.py` contains the implementation of our proposed method, "decoding with certainty prior".
 
 # Cache Implementation
 
