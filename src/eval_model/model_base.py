@@ -4,9 +4,7 @@ import torch
 import itertools
 
 from typing import cast
-from contextlib import nullcontext
 from datetime import timedelta
-from functools import partial
 from omegaconf import DictConfig
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.instance import Instance
@@ -19,7 +17,6 @@ from src.frame import Frame
 from src.generation import generate, decode_final_frame
 from src.utils import Timer, load_pretrained_model
 from src.eval_model.sanitize import sanitize
-from src.cache import d2Cache, PrefixCache
 
 
 class EvalModelBase(TemplateLM):
@@ -72,10 +69,13 @@ class EvalModelBase(TemplateLM):
                 )
 
     def postprocess_code(self, doc, code: str) -> str:
-        return sanitize(
-            doc["prompt"] + "\n" + code.split("```python\n", 1)[-1].split("```")[0],
-            doc["entry_point"],
-        )
+        code = code.split("```python\n", 1)[-1].split("```")[0]
+        if "entry_point" in doc:
+            return sanitize(
+                doc["prompt"] + "\n" + code,
+                doc["entry_point"],
+            )
+        return code
 
     def tok_encode(self, string: str, **kwargs):
         return self.tokenizer(string, **kwargs).input_ids
@@ -150,22 +150,21 @@ class EvalModelBase(TemplateLM):
                 full_tps.append(timer.token_per_step(decode_record, False))
                 latency.append(timer.elapsed_time_s / batch_size)
                 final_frame: Frame = decode_record[-1]
-                is_code_task = "task_id" in instances[0].doc and str(
-                    instances[0].doc["task_id"]
-                ).lower().startswith(("humaneval", "mbpp"))
                 generated_answer = [
                     cast(
                         str,
                         decode_final_frame(
                             self.tokenizer,
                             final_frame[i],
-                            stop_words=u if not is_code_task else None,
+                            stop_words=(
+                                u if not self.cfg.dataset.name == "humaneval" else None
+                            ),
                             skip_special_tokens=True,
                         ),
                     )
                     for i, u in enumerate(until)
                 ]
-                if is_code_task:
+                if self.cfg.dataset.name in ["humaneval", "mbpp"]:
                     generated_answer = [
                         self.postprocess_code(instance.doc, answer)
                         for instance, answer in zip(instances, generated_answer)

@@ -57,7 +57,7 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
             raise ValueError(
                 f"Unsupported task {task}, you should specify in {__file__}."
             )
-
+    # gen_length = 1024
     block_length = 32 if model.endswith("inst") else gen_length
     steps = gen_length
 
