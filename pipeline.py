@@ -35,6 +35,8 @@ def generate_tasks(gpus_per_task, run_dir):
 
                 task_specific_args = (
                     f"generation.gen_length={length} "
+                    f"generation.block_length={length} "
+                    f"generation.steps={length} "
                     f"cache.rollout_p={p} "
                     f"cache.current_k={k}"
                 )
@@ -63,6 +65,8 @@ def generate_tasks(gpus_per_task, run_dir):
 
             task_specific_args = (
                 f"generation.gen_length={length} "
+                f"generation.block_length={length} "
+                f"generation.steps={length} "
                 f"cache.rollout_p={fixed_rollout_p} "
                 f"cache.current_k={fixed_current_k} "
                 f"cache.sigma={sigma}"
@@ -103,6 +107,8 @@ def generate_tasks(gpus_per_task, run_dir):
                     f"dataset.name={dataset} "
                     f"{cache_arg} "
                     f"generation.gen_length={exp3_gen_length} "
+                    f"generation.block_length=32 " if cache != "d2cache" else f"generation.block_length={exp3_gen_length} "
+                    f"generation.steps={exp3_gen_length} "
                     f"{hydra_run_dir}"
                 )
                 

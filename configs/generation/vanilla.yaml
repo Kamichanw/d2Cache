@@ -6,9 +6,9 @@ threshold: null # all tokens whose confidence is above this threshold will be fi
 factor: null # factor-based parallel decoding factor
 
 alg: "maskgit_plus"
-gen_length: 256
-block_length: 256
-steps: 256
+gen_length: null
+block_length: null
+steps: null
 temperature: 0.0
 top_p: null
 top_k: null

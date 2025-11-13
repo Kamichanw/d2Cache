@@ -15,6 +15,8 @@ meow create --min-devices 4 --requires-memory-per-device 20000 -m --task-name "e
     generation=vanilla \
     model=$models \
     generation.gen_length=1024 \
+    generation.block_length=1024 \
+    generation.steps=1024 \
     hydra.run.dir='${run_dir}/${fullname}'
 
 meow create --min-devices 4 --requires-memory-per-device 20000 -m --task-name "exp3_model_cache_compare/{model}/{dataset.name}/no_cache" \
@@ -26,4 +28,6 @@ meow create --min-devices 4 --requires-memory-per-device 20000 -m --task-name "e
     generation=vanilla \
     model=$models \
     generation.gen_length=1024 \
+    generation.block_length=1024 \
+    generation.steps=1024 \
     hydra.run.dir='${run_dir}/${fullname}'

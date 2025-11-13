@@ -164,6 +164,8 @@ def sample_tokens(
     elif alg == "entropy":
         log_probs = torch.log(probs + epsilon)
         confidence = torch.sum(probs * log_probs, dim=-1)
+    elif alg == "random":
+        confidence = torch.rand_like(confidence)
 
     return confidence, x0, probs
 
