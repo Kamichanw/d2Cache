@@ -57,6 +57,7 @@ class EvalModelBase(TemplateLM):
         self.full_tps = None
         self.latency = None
         self.total_time = None
+        self.input_length = None
         self.device = self.accelerator.device
         self.extra_gen_kwargs = kwargs.get("extra_gen_kwargs", {})
 
@@ -110,6 +111,7 @@ class EvalModelBase(TemplateLM):
         out, throughput, tps = [], [], []
         full_throughput, full_tps = [], []
         latency = []
+        input_length = []
 
         batch_size = self.cfg.get("batch_size", 1)
 
@@ -144,6 +146,9 @@ class EvalModelBase(TemplateLM):
                         ignore_unknown_args="ignore",
                     )
 
+                input_length.append(
+                    torch.sum(inputs["attention_mask"]).item() / batch_size  # type: ignore
+                )
                 throughput.append(timer.token_per_second(decode_record))
                 full_throughput.append(timer.token_per_second(decode_record, False))
                 tps.append(timer.token_per_step(decode_record))
@@ -179,6 +184,7 @@ class EvalModelBase(TemplateLM):
         full_throughput = self.accelerator.gather_for_metrics(full_throughput)
         full_tps = self.accelerator.gather_for_metrics(full_tps)
         latency = self.accelerator.gather_for_metrics(latency)
+        input_length = self.accelerator.gather_for_metrics(input_length)
 
         if self.accelerator.is_main_process:
             self.tps = sum(tps) / len(tps)
@@ -187,6 +193,7 @@ class EvalModelBase(TemplateLM):
             self.full_throughput = sum(full_throughput) / len(full_throughput)
             self.latency = sum(latency) / len(latency)
             self.total_time = Timer.get_cumulative_s("eval")
+            self.input_length = sum(input_length) / len(input_length)
 
         return out
 

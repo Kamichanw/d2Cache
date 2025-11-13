@@ -1,6 +1,9 @@
 transformers==4.52.4
 torch==2.7.1
-datasets
+datasets==4.0.0
+jieba
+fuzzywuzzy
+rouge
 pydantic
 hydra-core
 accelerate==1.8.1
@@ -9,3 +12,4 @@ loguru
 python-dotenv
 math_verify
 sympy
+python-Levenshtein

@@ -277,7 +277,8 @@ class d2Cache(dCache):
         rollout_p: float = 0.1,
         current_k: int = 32,
         sigma: float = 10.0,
-        inflate_w: int = 8,
+        inflate_w: int = 4,
+        num_rollout_layers: int | None = None
     ):
         super().__init__(model_config)
         self.key_cache: list[torch.Tensor] = []
@@ -291,6 +292,7 @@ class d2Cache(dCache):
         self.current_k = current_k
         self.sigma = sigma
         self.inflate_w = inflate_w
+        self.num_rollout_layers = num_rollout_layers
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
@@ -382,8 +384,8 @@ class d2Cache(dCache):
                 self._attn_rollout = torch.eye(
                     self.key_cache[layer_idx].size(1), device=x.device, dtype=x.dtype
                 ).expand(x.size(0), -1, -1)
-
-            self.accumulate_attn_rollout(ctx.attn_weight)
+            if self.num_rollout_layers is None or self.num_rollout_layers <= layer_idx + 1:
+                self.accumulate_attn_rollout(ctx.attn_weight)
 
     def shift_mask_(self, q_mask: torch.Tensor, remaining_mask: torch.Tensor):
         """

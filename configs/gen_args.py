@@ -1,3 +1,4 @@
+from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 from typing import Any, Literal
 
@@ -45,18 +46,24 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
 
     # set based on task
     match task:
-        case "gsm8k" | "gsm8k_cot":
+        case (
+            "gsm8k"
+            | "gsm8k_cot"
+            | "math-500"
+            | "gpqa_main_generative_n_shot"
+            | "mmlu_pro"
+        ):
             gen_length = 256
-        case "humaneval":
+        case "humaneval" | "mbpp":
             gen_length = 512
-        case "math-500":
-            gen_length = 256
-        case "mbpp":
+        case task if "longbench" in task:
             gen_length = 512
         case _:
-            raise ValueError(
+            logger.info(
                 f"Unsupported task {task}, you should specify in {__file__}."
+                " Using default gen_length=512."
             )
+            gen_length = 512
     # gen_length = 1024
     block_length = 32 if model.endswith("inst") else gen_length
     steps = gen_length
@@ -120,6 +127,26 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
                             kp, kr = 25, 8
                         case "dream-inst":
                             kp, kr = 10, 8
+                case "gpqa_main_generative_n_shot":
+                    match model:
+                        case "llada-base":
+                            kp, kr = 100, 8
+                        case "llada-inst":
+                            kp, kr = 50, 6
+                        case "dream-base":
+                            kp, kr = 100, 8
+                        case "dream-inst":
+                            kp, kr = 10, 8 
+                case "mmlu_pro":
+                    match model:
+                        case "llada-base":
+                            kp, kr = 100, 6
+                        case "llada-inst":
+                            kp, kr = 50, 3
+                        case "dream-base":
+                            kp, kr = 25, 2
+                        case "dream-inst":
+                            kp, kr = 5, 1 
             cache_args = {"kp": kp, "kr": kr}
 
     # set based on model
