@@ -60,12 +60,11 @@ def overwrite_eval_task(cfg: DictConfig):
         eval_args["task_manager"] = task_manager
 
     if cfg.dataset.name == "mmlu_pro":
-        eval_args["num_fewshot"] = 4
-        if eval_args["limit"] > 200:
+        if eval_args["limit"] > 100:
             logger.info(
-                "MMLU-Pro dataset is too large, shrink to 200 for faster evaluation."
+                "MMLU-Pro dataset is too large, shrink to 1400 for faster evaluation."
             )
-            eval_args["limit"] = 200
+            eval_args["limit"] = 100
     return eval_args
 
 
@@ -83,7 +82,6 @@ def main(cfg: DictConfig) -> None:
             use_cache=(
                 os.path.join(output_dir, "response") if cfg.use_eval_cache else None
             ),
-            apply_chat_template=cfg.model.name.endswith("inst"),
             **overwrite_eval_task(cfg),
         )
     peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024**3)

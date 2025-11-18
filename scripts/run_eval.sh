@@ -53,9 +53,9 @@
 # # explicitly set sigma to 0 to disable certainty prior guided decoding
 accelerate launch \
     --num_machines 1 \
-    --num_processes 4 \
+    --num_processes 3 \
     eval.py \
-    dataset.name=gpqa_main_generative_n_shot \
+    dataset.name=humaneval \
     batch_size=1 \
     seed=1234 \
     dataset.size=4 \
