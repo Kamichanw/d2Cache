@@ -36,8 +36,8 @@ accelerate launch \
     generation=vanilla \
     model=dream-inst
 
-4.1 Test d2Cache on MBPP with Dream-v0-Base-7B, run:
-certainty prior guided decoding is enabled by default when using d2Cache
+# 4.1 Test d2Cache on MBPP with Dream-v0-Base-7B, run:
+# certainty prior guided decoding is enabled by default when using d2Cache
 accelerate launch \
     --num_machines 1 \
     --num_processes 4 \
@@ -51,7 +51,6 @@ accelerate launch \
 
 # 4.2 d2Cache is also compatible with semi-ar decoding and parallel decoding, run:
 # explicitly set sigma to 0 to disable certainty prior guided decoding
-export CUDA_VISIBLE_DEVICES=1
 accelerate launch \
     --num_machines 1 \
     --num_processes 1 \
@@ -59,7 +58,6 @@ accelerate launch \
     dataset.name=humaneval \
     batch_size=1 \
     seed=1234 \
-    dataset.size=10 \
     cache=d2cache \
     generation=vanilla \
     generation.threshold=0.9 \
