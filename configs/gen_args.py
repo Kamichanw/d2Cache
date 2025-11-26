@@ -1,6 +1,6 @@
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
-from typing import Any, Literal
+from typing import Literal
 
 
 class GenerationArgs(BaseModel):
@@ -64,7 +64,7 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
                 " Using default gen_length=512."
             )
             gen_length = 512
-    # gen_length = 1024
+
     block_length = 32 if model.endswith("inst") else gen_length
     steps = gen_length
 

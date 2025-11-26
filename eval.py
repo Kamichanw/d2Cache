@@ -31,7 +31,6 @@ def serializer(o):
         else:
             return o.tolist()
 
-    # raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
     return f"<unserializable object of type {o.__class__.__name__}>"
 
 
@@ -82,6 +81,7 @@ def main(cfg: DictConfig) -> None:
             use_cache=(
                 os.path.join(output_dir, "response") if cfg.use_eval_cache else None
             ),
+            apply_chat_template=cfg.model.name.endswith("inst"),
             **overwrite_eval_task(cfg),
         )
     peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024**3)
