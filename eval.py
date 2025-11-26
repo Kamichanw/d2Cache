@@ -31,7 +31,7 @@ def serializer(o):
         else:
             return o.tolist()
 
-    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+    return f"<unserializable object of type {o.__class__.__name__}>"
 
 
 dream_inst_humaneval = {
@@ -67,13 +67,17 @@ def main(cfg: DictConfig) -> None:
     output_dir = HydraConfig.get().runtime.output_dir
 
     patcher_ctx = sympy_antlr_patcher if cfg.dataset.name == "math-500" else nullcontext
+    torch.cuda.reset_peak_memory_stats()
     with patcher_ctx():
         results = simple_evaluate(
             model=model,
-            use_cache=os.path.join(output_dir, "response") if cfg.use_eval_cache else None,
+            use_cache=(
+                os.path.join(output_dir, "response") if cfg.use_eval_cache else None
+            ),
             apply_chat_template=cfg.model.name.endswith("inst"),
             **overwrite_eval_task(cfg),
         )
+    peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024**3)
 
     results_path = os.path.join(output_dir, "results.json")
 
@@ -85,7 +89,9 @@ def main(cfg: DictConfig) -> None:
                 f"Tokens per step: {model.tps:.2f} tokens/step "
                 f"(full: {model.full_throughput:.2f} tokens/sec, {model.full_tps:.2f} tokens/step), "
                 f"Latency: {model.latency:.2f} s, "
-                f"Total time: {model.total_time:.2f} s"
+                f"Total time: {model.total_time:.2f} s, "
+                f"Avg input length: {model.input_length:.2f} tokens, "
+                f"Peak memory allocated: {peak_memory_allocated:.2f} GB"
             )
             results["tps"] = model.tps
             results["throughput"] = model.throughput
@@ -93,6 +99,8 @@ def main(cfg: DictConfig) -> None:
             results["full_tps"] = model.full_tps
             results["full_throughput"] = model.full_throughput
             results["latency"] = model.latency
+            results["input_length"] = model.input_length
+            results["peak_memory_allocated_GB"] = peak_memory_allocated
 
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2, default=serializer)

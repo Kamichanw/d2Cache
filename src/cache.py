@@ -2,8 +2,6 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-import triton
-import triton.language as tl
 
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -277,29 +275,29 @@ class d2Cache(dCache):
         rollout_p: float = 0.1,
         current_k: int = 32,
         sigma: float = 10.0,
-        inflate_w: int = 8,
+        inflate_w: int = 4,
+        num_rollout_layers: int | None = None,
     ):
         super().__init__(model_config)
         self.key_cache: list[torch.Tensor] = []
         self.value_cache: list[torch.Tensor] = []
         self._conf_cache: torch.Tensor | None = None  # shape (B, G)
         self._full_q_mask: torch.Tensor | None = None  # shape (B, T)
-        self._full_remaining_mask: torch.Tensor  # shape (B, G)
         self._density_score: torch.Tensor  # shape (B, G)
         self._global_importance: torch.Tensor  # shape (B, T)
         self.rollout_p = rollout_p
         self.current_k = current_k
         self.sigma = sigma
         self.inflate_w = inflate_w
+        self.num_rollout_layers = num_rollout_layers
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
         with super().model_forward(x=x) as ctx:
             B, T, C = x.shape
             if self._full_q_mask is not None:
-                self.active_q_mask = self.shift_mask_(
-                    self.top_up_mask(self._full_q_mask[self.active_seq_mask]),
-                    self._full_remaining_mask[self.active_seq_mask],
+                self.active_q_mask = self.top_up_mask(
+                    self._full_q_mask[self.active_seq_mask]
                 )
                 ctx.x = x[self.active_q_mask].view(B, -1, C)
             yield ctx
@@ -382,32 +380,11 @@ class d2Cache(dCache):
                 self._attn_rollout = torch.eye(
                     self.key_cache[layer_idx].size(1), device=x.device, dtype=x.dtype
                 ).expand(x.size(0), -1, -1)
-
-            self.accumulate_attn_rollout(ctx.attn_weight)
-
-    def shift_mask_(self, q_mask: torch.Tensor, remaining_mask: torch.Tensor):
-        """
-        If model is dream, we need to retain the token before masked tokens.
-        To ensure each sequence has the same number of selected tokens, we only move the selected positions leftward
-        if the position before it is not selected.
-        """
-        if self.model_config.model_type.lower() == "dream":
-            B, T = q_mask.shape
-            P = T - remaining_mask.size(-1)
-            selected_mask = q_mask[:, P:] & remaining_mask
-
-            source_rows, source_cols = torch.where(selected_mask)
-
-            source_cols = source_cols + P
-            target_cols = source_cols - 1
-
-            target_is_false_mask = ~q_mask[source_rows, target_cols]
-
-            source_rows = source_rows[target_is_false_mask]
-
-            q_mask[source_rows, source_cols[target_is_false_mask]] = False
-            q_mask[source_rows, target_cols[target_is_false_mask]] = True
-        return q_mask
+            if (
+                self.num_rollout_layers is None
+                or self.num_rollout_layers <= layer_idx + 1
+            ):
+                self.accumulate_attn_rollout(ctx.attn_weight)
 
     def top_up_mask(self, q_mask: torch.Tensor):
         q_mask = q_mask.clone()
@@ -508,12 +485,17 @@ class d2Cache(dCache):
             k=min(self.current_k, remaining_mask.size(-1)),
             dim=-1,
         )
-        response_mask = (
+        selected_mask = (
             torch.zeros_like(remaining_mask, dtype=torch.bool).scatter_(
                 1, indices, True
             )
             & remaining_mask
         )
+        # if model is dream, we need to retain the token before masked tokens
+        if self.model_config.model_type.lower() == "dream":
+            response_mask = F.pad(selected_mask[:, 1:], (0, 1), value=False)
+        else:
+            response_mask = selected_mask
         # 2. recompute all new generated tokens, as they transform from mask to real tokens
         transfer_src_index = (
             delta.transfer_src_index
@@ -534,6 +516,10 @@ class d2Cache(dCache):
         # 3. for other tokens, select top-k tokens based on attention rollout
         global_importance = self._attn_rollout.sum(dim=1)
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
+        if self.model_config.model_type.lower() == "dream":
+            # if the first mask token is selected, we need to select the token before it
+            # i.e., the last prompt token
+            q_mask[:, P - 1] = selected_mask[:, 0]  # type: ignore
 
         # 4. inflate the mask: if two selected tokens are within a window, select all tokens between them.
         if self.inflate_w > 0:
@@ -562,12 +548,10 @@ class d2Cache(dCache):
 
         if self._full_q_mask is None:
             self._full_q_mask = q_mask
-            self._full_remaining_mask = remaining_mask
             self._global_importance = global_importance
             self._density_score = scores
         else:
             self._full_q_mask[self.active_seq_mask] = q_mask
-            self._full_remaining_mask[self.active_seq_mask] = remaining_mask
             self._global_importance[self.active_seq_mask] = global_importance
             self._density_score[self.active_seq_mask] = scores
 

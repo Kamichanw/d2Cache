@@ -4,9 +4,7 @@ import torch
 import itertools
 
 from typing import cast
-from contextlib import nullcontext
 from datetime import timedelta
-from functools import partial
 from omegaconf import DictConfig
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.instance import Instance
@@ -19,7 +17,6 @@ from src.frame import Frame
 from src.generation import generate, decode_final_frame
 from src.utils import Timer, load_pretrained_model
 from src.eval_model.sanitize import sanitize
-from src.cache import d2Cache, PrefixCache
 
 
 class EvalModelBase(TemplateLM):
@@ -60,6 +57,7 @@ class EvalModelBase(TemplateLM):
         self.full_tps = None
         self.latency = None
         self.total_time = None
+        self.input_length = None
         self.device = self.accelerator.device
         self.extra_gen_kwargs = kwargs.get("extra_gen_kwargs", {})
 
@@ -72,10 +70,13 @@ class EvalModelBase(TemplateLM):
                 )
 
     def postprocess_code(self, doc, code: str) -> str:
-        return sanitize(
-            doc["prompt"] + "\n" + code.split("```python\n", 1)[-1].split("```")[0],
-            doc["entry_point"],
-        )
+        code = code.split("```python\n", 1)[-1].split("```")[0]
+        if "entry_point" in doc:
+            return sanitize(
+                doc["prompt"] + "\n" + code,
+                doc["entry_point"],
+            )
+        return code
 
     def tok_encode(self, string: str, **kwargs):
         return self.tokenizer(string, **kwargs).input_ids
@@ -110,6 +111,7 @@ class EvalModelBase(TemplateLM):
         out, throughput, tps = [], [], []
         full_throughput, full_tps = [], []
         latency = []
+        input_length = []
 
         batch_size = self.cfg.get("batch_size", 1)
 
@@ -144,28 +146,30 @@ class EvalModelBase(TemplateLM):
                         ignore_unknown_args="ignore",
                     )
 
+                input_length.append(
+                    torch.sum(inputs["attention_mask"]).item() / batch_size  # type: ignore
+                )
                 throughput.append(timer.token_per_second(decode_record))
                 full_throughput.append(timer.token_per_second(decode_record, False))
                 tps.append(timer.token_per_step(decode_record))
                 full_tps.append(timer.token_per_step(decode_record, False))
                 latency.append(timer.elapsed_time_s / batch_size)
                 final_frame: Frame = decode_record[-1]
-                is_code_task = "task_id" in instances[0].doc and str(
-                    instances[0].doc["task_id"]
-                ).lower().startswith(("humaneval", "mbpp"))
                 generated_answer = [
                     cast(
                         str,
                         decode_final_frame(
                             self.tokenizer,
                             final_frame[i],
-                            stop_words=u if not is_code_task else None,
+                            stop_words=(
+                                u if not self.cfg.dataset.name == "humaneval" else None
+                            ),
                             skip_special_tokens=True,
                         ),
                     )
                     for i, u in enumerate(until)
                 ]
-                if is_code_task:
+                if self.cfg.dataset.name in ["humaneval", "mbpp"]:
                     generated_answer = [
                         self.postprocess_code(instance.doc, answer)
                         for instance, answer in zip(instances, generated_answer)
@@ -180,6 +184,7 @@ class EvalModelBase(TemplateLM):
         full_throughput = self.accelerator.gather_for_metrics(full_throughput)
         full_tps = self.accelerator.gather_for_metrics(full_tps)
         latency = self.accelerator.gather_for_metrics(latency)
+        input_length = self.accelerator.gather_for_metrics(input_length)
 
         if self.accelerator.is_main_process:
             self.tps = sum(tps) / len(tps)
@@ -188,6 +193,7 @@ class EvalModelBase(TemplateLM):
             self.full_throughput = sum(full_throughput) / len(full_throughput)
             self.latency = sum(latency) / len(latency)
             self.total_time = Timer.get_cumulative_s("eval")
+            self.input_length = sum(input_length) / len(input_length)
 
         return out
 
