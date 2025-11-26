@@ -51,19 +51,12 @@ def overwrite_eval_task(cfg: DictConfig):
         )
         eval_args["tasks"] = [task]
 
-    if cfg.dataset.name == "math-500" or "longbench" in cfg.dataset.name:
-        dirname = "math-500" if cfg.dataset.name == "math-500" else "longbench"
+    if cfg.dataset.name == "math-500":
         task_manager = TaskManager(
-            include_path=str(Path(__file__).parent / "tasks" / dirname)
+            include_path=str(Path(__file__).parent / "tasks" / "math-500")
         )
         eval_args["task_manager"] = task_manager
 
-    if cfg.dataset.name == "mmlu_pro":
-        if eval_args["limit"] > 100:
-            logger.info(
-                "MMLU-Pro dataset is too large, shrink to 1400 for faster evaluation."
-            )
-            eval_args["limit"] = 100
     return eval_args
 
 
