@@ -157,8 +157,8 @@ def sample_tokens(
     if alg == "topk_margin":
         sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
         # Extract top1 and top2 probabilities
-        top1_probs = sorted_probs[:, 0]
-        top2_probs = sorted_probs[:, 1]
+        top1_probs = sorted_probs[..., 0]
+        top2_probs = sorted_probs[..., 1]
         # Calculate confidence as top1 - top2
         confidence = top1_probs - top2_probs
     elif alg == "entropy":
