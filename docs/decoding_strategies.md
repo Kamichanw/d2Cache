@@ -61,7 +61,7 @@ accelerate launch \
     dataset.name=gsm8k \
     batch_size=1 \
     seed=1234 \
-    generation=vanilla \
+    generation=pc_sampler \
     generation.steps=256 \
     generation.gen_length=256 \
     generation.block_length=32 \
@@ -94,3 +94,56 @@ accelerate launch \
     generation.sigma=10 \
     model=llada-inst 
 ```
+
+## Beyond Fixed: Training-Free Variable-Length Denoising for Diffusion Large Language Models
+Jinsong Li, Xiaoyi Dong, Yuhang Zang, Yuhang Cao, Jiaqi Wang, Dahua Lin
+
+### Abstract
+Diffusion Large Language Models (DLLMs) are emerging as a powerful alternative to the dominant Autoregressive Large Language Models, offering efficient parallel generation and capable global context modeling. However, the practical application of DLLMs is hindered by a critical architectural constraint: the need for a statically predefined generation length. This static length allocation leads to a problematic trade-off: insufficient lengths cripple performance on complex tasks, while excessive lengths incur significant computational overhead and sometimes result in performance degradation. While the inference framework is rigid, we observe that the model itself possesses internal signals that correlate with the optimal response length for a given task. To bridge this gap, we leverage these latent signals and introduce DAEDAL, a novel training-free denoising strategy that enables Dynamic Adaptive Length Expansion for Diffusion Large Language Models. DAEDAL operates in two phases: 1) Before the denoising process, DAEDAL starts from a short initial length and iteratively expands it to a coarse task-appropriate length, guided by a sequence completion metric. 2) During the denoising process, DAEDAL dynamically intervenes by pinpointing and expanding insufficient generation regions through mask token insertion, ensuring the final output is fully developed. Extensive experiments on DLLMs demonstrate that DAEDAL achieves performance comparable, and in some cases superior, to meticulously tuned fixed-length baselines, while simultaneously enhancing computational efficiency by achieving a higher effective token ratio. By resolving the static length constraint, DAEDAL unlocks new potential for DLLMs, bridging a critical gap with their Autoregressive counterparts and paving the way for more efficient and capable generation.
+
+### Example Usage
+Here are full description of hyper-parameters and their default values:
+```yaml
+# our param name           vs   official param name
+# initial_gen_length        --   initial_gen_length
+# initial_eot_expand_thres  --   eos_confidence_threshold
+# decode_eot_expand_thres  --   expand_eos_confidence_threshold
+# low_conf_expand_thres    --   low_conf_threshold
+# threshold (in vanilla)   --   high_conf_threshold
+# max_gen_length           --   max_gen_length
+
+initial_gen_length: 64
+
+# at [Stage-1] Initial Length Adjustment, if the average confidence of the last `num_check_last_eot` tokens
+# is lower than `initial_eot_expand_thres`, we expand the generation length
+initial_eot_expand_thres: 0.5
+
+# at [Stage-2] Iterative Denoising and Mask Insertion, if the average confidence of the last `num_check_last_eot` tokens
+# is lower than `decode_eot_expand_thres`, we expand the generation length
+decode_eot_expand_thres: 0.9
+# at Stage 2, if we decide to expand, we replace select the lowest-confidence tokens whose confidence is below this threshold
+# as the expansion point
+low_conf_expand_thres: 0.1
+
+# # of last EOT tokens to check
+num_check_last_eot: 32
+# replace the expansion point to expansion_factor masked tokens
+expansion_factor: 8
+max_gen_length: 2048
+```
+```bash
+# Test DAEDAL decoding on GSM8K with LLaDA-7B-Instruct, run:
+accelerate launch \
+    --num_machines 1 \
+    --num_processes 4 \
+    eval.py \
+    dataset.name=humaneval \
+    batch_size=8 \
+    seed=1234 \
+    generation=daedal \
+    generation.initial_gen_length=128 \
+    model=llada-inst 
+```
+
+> [!NOTE]
+> DAEDAL is not compatible to all current KV cache methods.

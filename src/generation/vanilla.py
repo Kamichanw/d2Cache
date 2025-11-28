@@ -264,7 +264,7 @@ def generate_step(
         ),
         confidence=confidence,
         probs=(
-            torch.where(transfer_index_mask[can_generate], p, -torch.inf)
+            torch.where(transfer_index_mask[can_generate].unsqueeze(-1), p, -torch.inf)
             if output_probs
             else None
         ),

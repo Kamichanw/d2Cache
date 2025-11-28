@@ -1,0 +1,32 @@
+defaults:
+  - vanilla
+  - _self_
+  
+strategy: daedal
+
+# our param name           vs   official param name
+# initial_gen_length        --   initial_gen_length
+# initial_eot_expand_thres  --   eos_confidence_threshold
+# decode_eot_expand_thres  --   expand_eos_confidence_threshold
+# low_conf_expand_thres    --   low_conf_threshold
+# threshold (in vanilla)   --   high_conf_threshold
+# max_gen_length           --   max_gen_length
+
+initial_gen_length: 64
+block_length: 32 # semi-ar is forced to be enabled
+
+# at [Stage-1] Initial Length Adjustment, if the average confidence of the last `num_check_last_eot` tokens
+# is lower than `initial_eot_expand_thres`, we expand the generation length
+initial_eot_expand_thres: 0.5
+# at [Stage-2] Iterative Denoising and Mask Insertion, if the average confidence of the last `num_check_last_eot` tokens
+# is lower than `decode_eot_expand_thres`, we expand the generation length
+decode_eot_expand_thres: 0.9
+# at Stage 2, if we decide to expand, we replace select the lowest-confidence tokens whose confidence is below this threshold
+# as the expansion point
+low_conf_expand_thres: 0.1
+
+# # of last EOT tokens to check
+num_check_last_eot: 32
+# replace the expansion point to expansion_factor masked tokens
+expansion_factor: 8
+max_gen_length: 2048

@@ -38,7 +38,7 @@ The corresponding usages can be found [here](./docs/decoding_strategies.md).
 | Parallel | <a href="https://arxiv.org/abs/2505.22618"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-Fast--dLLM-blue"></a> |
 | PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.13021-red"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-PC--Sampler-blue"></a> |
 | Certainty Prior Decoding | <a href="https://arxiv.org/abs/2509.23094"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2509.23094-red"></a> | This Repo|
-|DAEDAL (WIP) |<a href="https://arxiv.org/abs/2508.00819"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.00819-red"></a> | <a href="https://github.com/Li-Jinsong/DAEDAL"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-DAEDAL-blue"></a> |
+|DAEDAL |<a href="https://arxiv.org/abs/2508.00819"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.00819-red"></a> | <a href="https://github.com/Li-Jinsong/DAEDAL"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-DAEDAL-blue"></a> |
 | KLASS (WIP)| <a href="https://arxiv.org/abs/2511.05664"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2511.05664-red"></a> | <a href="https://github.com/shkim0116/KLASS"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-KLASS-blue"></a> |
 # Setup
 ```bash
