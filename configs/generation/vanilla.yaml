@@ -16,9 +16,4 @@ top_k: null
 # The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
 sigma: null 
 
-# whether to use debiasing trivial tokens, see https://arxiv.org/pdf/2508.13021
-# to enable debiasing, {model-family.lower()}_corpus.json should be placed in the src/third_party/ directory
-# e.g., llada_corpus.json for LLaDA
-debias: false
-
 output_probs: false

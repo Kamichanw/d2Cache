@@ -1,9 +1,11 @@
 import re
 import torch
+import torch.distributions as dists
 
 from src.frame import PLACEHOLDER_STEP, Frame
 from src.llada import LLaDAModelLM
 from src.dream import DreamModel
+from src.dream.generation_utils import top_k_logits, top_p_logits
 
 
 def prepare_logits_for_generation(model, logits: torch.Tensor):
@@ -64,3 +66,59 @@ def decode_final_frame(
     )
 
     return texts if final_frame.is_batched else texts[0]
+
+
+_token_freq: torch.Tensor | None = None
+
+
+def sample_tokens(
+    logits,
+    temperature=0.0,
+    top_p=None,
+    top_k=None,
+    debias=False,
+    clip_alpha=None,
+    alg="maskgit_plus",
+):
+
+    if temperature > 0:
+        logits = logits / temperature
+    if top_p is not None and top_p < 1:
+        logits = top_p_logits(logits, top_p)
+    if top_k is not None:
+        logits = top_k_logits(logits, top_k)
+    probs = torch.softmax(logits, dim=-1)
+
+    if temperature > 0:
+        try:
+            x0 = dists.Categorical(probs=probs).sample()
+            confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
+        except:
+            confidence, x0 = probs.max(dim=-1)
+    else:
+        confidence, x0 = probs.max(dim=-1)
+
+    epsilon = 1e-10
+    if debias:
+        global _token_freq
+        alpha = clip_alpha if clip_alpha is not None else 10.0
+        if _token_freq is None:
+            raise ValueError("Token frequency not initialized for debiasing.")
+        confidence = torch.clamp_max(
+            -confidence * torch.log(_token_freq[x0] + epsilon), max=alpha
+        )
+
+    if alg == "topk_margin":
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        # Extract top1 and top2 probabilities
+        top1_probs = sorted_probs[..., 0]
+        top2_probs = sorted_probs[..., 1]
+        # Calculate confidence as top1 - top2
+        confidence = top1_probs - top2_probs
+    elif alg == "entropy":
+        log_probs = torch.log(probs + epsilon)
+        confidence = torch.sum(probs * log_probs, dim=-1)
+    elif alg == "random":
+        confidence = torch.rand_like(confidence)
+
+    return confidence, x0, probs

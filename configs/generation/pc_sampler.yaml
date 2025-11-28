@@ -1,0 +1,10 @@
+defaults:
+  - vanilla
+  - _self_
+
+# whether to use debiasing trivial tokens, see https://arxiv.org/pdf/2508.13021
+# to enable debiasing, {model-family.lower()}_corpus.json should be placed in the src/third_party/ directory
+# e.g., llada_corpus.json for LLaDA
+debias: true
+
+clip_alpha: 10
