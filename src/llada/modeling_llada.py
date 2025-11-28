@@ -1095,8 +1095,8 @@ class LLaDAModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        input_embeddings: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[dCache] = None,
@@ -1128,6 +1128,8 @@ class LLaDAModel(nn.Module):
         ), "Alibi length extrapolation is not supported for MDM."
         assert self.config.rope, "Rope must be used in Llama-Encoder for MDM."
         assert self.config.block_group_size == 1
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must provide input_ids or inputs_embeds.")
 
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else False
@@ -1135,14 +1137,14 @@ class LLaDAModel(nn.Module):
         # create a dummy cache to simplify code
         past_key_values = past_key_values or dCache(self.config)
         batch_size, seq_len = (
-            input_ids.size()
-            if input_embeddings is None
-            else input_embeddings.size()[:2]
+            input_ids.size() # type: ignore
+            if inputs_embeds is None
+            else inputs_embeds.size()[:2]
         )
 
         # Get embeddings of input.
         # shape: (batch_size, seq_len, d_model)
-        x = self.transformer.wte(input_ids) if input_embeddings is None else input_embeddings  # type: ignore
+        x = self.transformer.wte(input_ids) if inputs_embeds is None else inputs_embeds  # type: ignore
 
         if self.config.input_emb_norm:
             x = x * (self.config.d_model**0.5)
@@ -1235,7 +1237,7 @@ class LLaDAModelLM(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -1264,7 +1266,7 @@ class LLaDAModelLM(PreTrainedModel):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.forward(
             input_ids=input_ids,
-            input_embeddings=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
