@@ -85,3 +85,6 @@ If you find d²Cache or this repository useful for your research and application
 ```
 # Acknowledgment
 We would like to thank the authors of all models and baseline methods for their excellent work and open-source contributions.
+
+# License
+This project is licensed under the Apache 2.0 License. See the [LICENSE](./LICENSE) file for details.
