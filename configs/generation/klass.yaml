@@ -4,7 +4,6 @@ strategy: klass
 conf_threshold: 0.9
 kl_threshold: 0.01
 kl_history_length: 2
-unmask_strategy: "all" # options: all, max_conf, min_kl, random
 
 # General generation parameters
 alg: "klass"

@@ -7,7 +7,7 @@ from typing import Type
 from src.cache import dCache
 from src.frame import Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import prepare_logits_for_generation, sample_tokens
-from src.generation.vanilla import get_num_transfer_tokens
+from src.generation.vanilla import get_num_transfer_tokens, confidence_unmasking
 from src.utils import register
 
 @register.gen_strategy("klass")
@@ -28,7 +28,6 @@ def klass_generate(
     conf_threshold: float = 0.9,
     kl_threshold: float = 0.01,
     kl_history_length: int = 2,
-    unmask_strategy: str = "all", # all, max_conf, min_kl, random
     # Common args
     output_hidden_states: bool = False,
     output_probs: bool = False,
@@ -130,6 +129,7 @@ def klass_generate(
             prompt_length = frame.prompts.shape[1]
             
             # Apply dream-specific mask correction if needed
+            valid_mask = None
             if cache is not None and cache.active_q_mask is not None:
                 if model.config.model_type.lower() == "dream":
                     valid_mask = cache.active_q_mask[:, prompt_length - 1 : -1]
@@ -158,8 +158,11 @@ def klass_generate(
                 )
 
             # Update active parts of history
-            active_indices = torch.nonzero(can_generate).squeeze(-1)
+            active_indices = torch.nonzero(can_generate).view(-1)
             
+            if active_indices.numel() == 0:
+                continue
+
             # Sample tokens (get x0 and confidence)
             # KLASS uses top-1 confidence by default for 'klass' alg
             confidence_active, x0_active, _ = sample_tokens(
@@ -179,11 +182,26 @@ def klass_generate(
             
             # Update History buffers
             # Roll and update kl_history
-            kl_history[active_indices] = torch.roll(kl_history[active_indices], shifts=-1, dims=-1)
-            kl_history[active_indices, :, -1] = kl_current_prev
+            current_kl_hist = kl_history[active_indices]
+            rolled_hist = torch.roll(current_kl_hist, shifts=-1, dims=-1)
+            rolled_hist[..., -1] = kl_current_prev
             
-            # Update p_prev
-            p_prev[active_indices] = p_curr
+            if valid_mask is not None:
+                # Only update history for valid positions
+                # valid_mask: (B_active, gen_length)
+                kl_history[active_indices] = torch.where(
+                    valid_mask.unsqueeze(-1), 
+                    rolled_hist, 
+                    current_kl_hist
+                )
+                p_prev[active_indices] = torch.where(
+                    valid_mask.unsqueeze(-1), 
+                    p_curr, 
+                    p_prev_active
+                )
+            else:
+                kl_history[active_indices] = rolled_hist
+                p_prev[active_indices] = p_curr
             
             # 5. Determine Selection Masks (Stable & Confident)
             
@@ -192,65 +210,49 @@ def klass_generate(
             else:
                 stable_mask_active = torch.zeros_like(confidence_active, dtype=torch.bool)
             
-            conf_mask_active = confidence_active > conf_threshold
+            # conf_mask_active is handled inside confidence_unmasking via 'threshold'
             
             # Only consider tokens in current block and currently masked
             current_block_mask_active = block_mask[active_indices]
             current_remaining_mask_active = remaining_mask[active_indices]
             
-            ready_mask_active = stable_mask_active & conf_mask_active & current_block_mask_active & current_remaining_mask_active
-            
-            # 6. Apply Unmasking Strategy
-            transfer_index = []
-            
-            # We need fallback counts
-            fallback_counts = num_transfer_tokens_schedule[active_indices, i]
-            
-            for b_idx in range(len(active_indices)):
-                ready_indices = torch.where(ready_mask_active[b_idx])[0]
-                
-                selected_indices = None
-                
-                if len(ready_indices) > 0:
-                    # KLASS Strategy Selection
-                    if len(ready_indices) > 1 and unmask_strategy != "all":
-                        if unmask_strategy == "max_conf":
-                            conf_vals = confidence_active[b_idx, ready_indices]
-                            max_idx = torch.argmax(conf_vals)
-                            selected_indices = ready_indices[max_idx:max_idx+1]
-                        elif unmask_strategy == "min_kl":
-                            kl_vals = kl_current_prev[b_idx, ready_indices]
-                            min_idx = torch.argmin(kl_vals)
-                            selected_indices = ready_indices[min_idx:min_idx+1]
-                        elif unmask_strategy == "random":
-                            rand_idx = torch.randint(0, len(ready_indices), (1,), device=model.device)
-                            selected_indices = ready_indices[rand_idx]
-                        else:
-                            selected_indices = ready_indices
-                    else:
-                        selected_indices = ready_indices
-                
-                # Fallback Logic (if no tokens selected by KLASS or forced by linear schedule if empty)
-                if selected_indices is None or len(selected_indices) == 0:
-                    # Fallback to linear schedule count
-                    k = fallback_counts[b_idx].item()
-                    if k > 0:
-                        # Mask out already unmasked or non-block tokens for top-k selection
-                        valid_mask_for_topk = current_block_mask_active[b_idx] & current_remaining_mask_active[b_idx]
-                        masked_conf = torch.where(valid_mask_for_topk, confidence_active[b_idx], -torch.inf)
-                        
-                        # We need to pick top k
-                        num_valid = valid_mask_for_topk.sum()
-                        k = min(k, num_valid)
-                        if k > 0:
-                            _, selected_indices = torch.topk(masked_conf, k=k)
-                        else:
-                             selected_indices = torch.tensor([], dtype=torch.long, device=model.device)
-                    else:
-                        selected_indices = torch.tensor([], dtype=torch.long, device=model.device)
-                
-                transfer_index.append(selected_indices)
+            # Transfer mask: In-Block AND Masked (Base mask for all operations)
+            base_mask = current_block_mask_active & current_remaining_mask_active
+            if valid_mask is not None:
+                base_mask = base_mask & valid_mask
 
+            # Mask 1: Stable AND Base (For KLASS strategy)
+            stable_transfer_mask = stable_mask_active & base_mask
+            
+            # Mask 2: Base only (For Fallback strategy)
+            fallback_transfer_mask = base_mask
+
+            # 6. Apply Unmasking Strategy
+            
+            # We need fallback counts for the active batch
+            fallback_counts = num_transfer_tokens_schedule[active_indices, i] # (B_active,)
+
+            # Call 1: KLASS Selection (Stable & High Confidence)
+            # num_transfer_tokens=0 means "select only based on threshold", no forced top-k filling
+            ta = confidence_unmasking(
+                scores=confidence_active,
+                transfer_index_mask=stable_transfer_mask,
+                num_transfer_tokens=torch.zeros_like(fallback_counts),
+                threshold=conf_threshold
+            )
+            
+            # Call 2: Fallback Selection (Top-K Confidence, ignoring stability)
+            # threshold=None means "select purely based on num_transfer_tokens (Top-K)"
+            tb = confidence_unmasking(
+                scores=confidence_active,
+                transfer_index_mask=fallback_transfer_mask,
+                num_transfer_tokens=fallback_counts,
+                threshold=None
+            )
+            
+            # Merge results: Use KLASS selection if available, otherwise fallback to Top-K
+            transfer_index = tuple(a if a.numel() > 0 else b for a, b in zip(ta, tb))
+            
             # 7. Create Delta
             
             full_transfer_index = []
