@@ -1,0 +1,19 @@
+strategy: klass
+
+# KLASS specific parameters
+conf_threshold: 0.9
+kl_threshold: 0.01
+kl_history_length: 2
+unmask_strategy: "all" # options: all, max_conf, min_kl, random
+
+# General generation parameters
+alg: "klass"
+steps: 128
+block_length: 32
+gen_length: 128
+temperature: 0.0
+top_p: null
+top_k: null
+
+output_probs: false
+
