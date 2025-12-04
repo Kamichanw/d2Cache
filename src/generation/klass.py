@@ -21,6 +21,7 @@ def generate_step(
     # klass
     prev_probs: torch.Tensor,
     kl_history: torch.Tensor,
+    kl_threshold: float = 0.02,
     attention_mask: torch.Tensor | None = None,
     past_key_values: dCache | None = None,
     alg: str = "maskgit_plus",
@@ -89,11 +90,7 @@ def generate_step(
     attention_mask = (
         attention_mask[can_generate] if attention_mask is not None else None
     )
-    num_transfer_tokens = (
-        num_transfer_tokens[can_generate]
-        if isinstance(num_transfer_tokens, torch.Tensor)
-        else num_transfer_tokens
-    )
+    num_transfer_tokens = num_transfer_tokens[can_generate]
     outputs = model(
         x,
         attention_mask=attention_mask,
@@ -133,22 +130,44 @@ def generate_step(
 
     # ----------------------------- Klass-specific logic -----------------------------
     eps = 1e-12
-    kl_current_prev = (
-        p_curr * (torch.log(p_curr + eps) - torch.log(prev_probs + eps))
-    ).sum(dim=-1)
+    kl_current_prev = (p * (torch.log(p + eps) - torch.log(prev_probs + eps))).sum(
+        dim=-1
+    )
     # Shift kl_history and insert new KL at the end
-    kl_history = torch.roll(kl_history, shifts=-1, dims=-1)
-    kl_history[..., -1] = kl_current_prev
-    # ----------------------------- Klass-specific end -----------------------------
+    active_index = torch.nonzero(can_generate, as_tuple=True)[0]
+    kl_history[active_index] = kl_history[active_index].roll(shifts=-1, dims=-1)
+    kl_history[active_index, ..., -1] = kl_current_prev[active_index]
 
-    # select tokens to transfer based on probs and mask
-    transfer_index = confidence_unmasking(
+    stable_mask = torch.zeros_like(transfer_index_mask)
+    stable_mask[active_index] = torch.all(
+        kl_history[active_index] < kl_threshold, dim=-1
+    )
+    failback_transfer_mask = transfer_index_mask & block_mask
+    stable_transfer_mask = failback_transfer_mask & stable_mask
+
+    # Case 1: select based on KL stability & confidence
+    ta = confidence_unmasking(
         scores=scores,
-        transfer_index_mask=(transfer_index_mask & block_mask)[can_generate],
-        num_transfer_tokens=num_transfer_tokens,
+        transfer_index_mask=stable_transfer_mask[can_generate],
+        num_transfer_tokens=torch.zeros_like(num_transfer_tokens),  # disable fallback
         threshold=threshold,
         factor=factor,
     )
+
+    # Case 2 (failback): select based on top-k confidence
+    tb = confidence_unmasking(
+        scores=scores,
+        transfer_index_mask=failback_transfer_mask[can_generate],
+        num_transfer_tokens=num_transfer_tokens,
+        threshold=None,  # disable parallel decoding
+        factor=None,
+    )
+
+    transfer_index = tuple(
+        ta_idx if ta_idx.numel() > 0 else tb_idx for ta_idx, tb_idx in zip(ta, tb)
+    )
+
+    # ----------------------------- Klass-specific end -----------------------------
     transfer_index_iter = iter(transfer_index)
     transfer_index = tuple(
         (
@@ -173,7 +192,8 @@ def generate_step(
         intermediate=Intermediate(
             hidden_states=hidden_states if hidden_states is not None else tuple()
         ),
-    )
+        extra=dict(curr_probs=p, active_index=active_index),
+    ).to(model.dtype)
     return delta.unbatch() if not frame.is_batched else delta
 
 
@@ -203,22 +223,7 @@ def klass_generate(
     cache_cls: Type[dCache] | None = None,
 ) -> DecodeRecord:
     """
-    Vanilla generation for diffusion large language models.
-    Args:
-        model: Mask predictor.
-        input_ids: A tensor of shape (B, prompt_len).
-        steps: Sampling steps, less than or equal to gen_length.
-        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-        gen_length: Generated answer length.
-        temperature: Categorical distribution sampling temperature.
-        mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
-        top_k: The number of highest probability tokens to keep for one generation step.
-        top_p: The cumulative probability threshold for nucleus sampling.
-        sigma: The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
-        threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
-        factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
-        output_hidden_states: Whether to return the hidden states of all decoded tokens from layers.
-        output_probs: Whether to return the probs of all tokens.
+    KLASS generation strategy: KL-Adaptive Stability Sampling.
     """
 
     if mask_token_id is None and os.environ.get("MASK_TOKEN_ID", None) is None:
@@ -253,19 +258,19 @@ def klass_generate(
 
     deltas = []
     kl_history = torch.zeros(
-        (batch_size, prompt_length + gen_length, kl_history_length),
+        (batch_size, gen_length, kl_history_length),
         dtype=torch.float64,
         device=model.device,
     )
     prev_probs = torch.zeros(
-        (batch_size, prompt_length + gen_length, model.config.vocab_size),
+        (batch_size, gen_length, model.config.vocab_size),
         dtype=torch.float64,
         device=model.device,
     )
 
     for block_idx in range(num_blocks):
         block_mask = torch.zeros(
-            (input_ids.size(0), gen_length),
+            (batch_size, gen_length),
             dtype=torch.bool,
             device=model.device,
         )
@@ -289,6 +294,7 @@ def klass_generate(
                 num_transfer_tokens=num_transfer_tokens[:, i],
                 prev_probs=prev_probs,
                 kl_history=kl_history,
+                kl_threshold=kl_threshold,
                 attention_mask=attention_mask,
                 past_key_values=cache,
                 alg=alg,
@@ -305,6 +311,9 @@ def klass_generate(
             if delta is None:
                 # if no more mask tokens are left, break the loop
                 break
+            prev_probs[delta.extra["active_index"]] = delta.extra["curr_probs"].to(torch.float64)
+            delta.extra.pop("curr_probs")
+            delta.extra.pop("active_index")
             if cache is not None:
                 cache.on_step_end(block_mask, frame, delta)
 

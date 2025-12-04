@@ -40,7 +40,7 @@ accelerate launch \
     generation.steps=256 \
     generation.gen_length=256 \
     generation.block_length=32 \
-    generation.threshold-0.9 \
+    generation.threshold=0.9 \
     model=llada-inst 
 ```
 

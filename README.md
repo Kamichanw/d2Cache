@@ -57,6 +57,7 @@ cp .env.example .env
 # Evaluation
 
 Please check docs/ for detailed instructions on how to run evaluations with different methods.
+A quick example is shown in [srcipts/run_eval.sh](./scripts/run_eval.sh).
 
 Available models:
 - llada-base: GSAI-ML/LLaDA-8B-Base
