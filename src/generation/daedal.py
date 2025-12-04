@@ -1,6 +1,5 @@
 import os
 import torch
-import torch.nn.functional as F
 
 from src.frame import Frame, DecodeRecord, FrameDelta
 from src.generation.vanilla import generate_step
