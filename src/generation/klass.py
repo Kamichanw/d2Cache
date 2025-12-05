@@ -8,110 +8,7 @@ from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import prepare_logits_for_generation, sample_tokens
 from src.utils import certainty_density, register
-from src.third_party import get_token_freq
-
-
-def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
-    """
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
-    the expected number of tokens transitioned at each step should be consistent.
-
-    This function is designed to precompute the number of tokens that need to be transitioned at each step.
-
-    Args:
-        mask_index: A boolean tensor of shape (B, L) indicating the positions of mask
-        steps: The number of steps in a block to sample.
-
-    Returns:
-        A tensor of shape (B, steps) indicating the number of tokens to be transferred at each step.
-    """
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-
-    base = mask_num // steps
-    remainder = mask_num % steps
-
-    num_transfer_tokens = (
-        torch.zeros(
-            mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
-        )
-        + base
-    )
-
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, : remainder[i]] += 1
-
-    return num_transfer_tokens
-
-
-def confidence_unmasking(
-    scores: torch.Tensor,
-    transfer_index_mask: torch.Tensor,
-    num_transfer_tokens: torch.Tensor,
-    threshold: float | torch.Tensor | None = None,
-    factor: float | None = None,
-) -> tuple[torch.Tensor, ...]:
-    """
-    Select tokens to be fixed based on token probs, i.e., confidence.
-    It consists of parallel decoding and low-confidence remasking.
-    Args:
-        token_probs: A tensor of shape [B, gen_length] containing the probabilities of each token.
-        transfer_index_mask: A boolean tensor of shape [B, gen_length] indicating which tokens can be transferred.
-        num_transfer_tokens: A tensor of shape [B,] indicating the number of tokens to be transferred at each step.
-        threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
-        factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
-    """
-    batch_size, _ = scores.shape
-
-    confidence = torch.where(transfer_index_mask, scores, -torch.inf)
-    transfer_index = [torch.tensor([]) for _ in range(batch_size)]
-    if threshold is not None or factor is not None:
-        if threshold is not None:
-            # 1.a select all tokens whose confidence is above the threshold
-            col_indices = torch.nonzero(confidence >= threshold, as_tuple=False)[:, 1]
-            counts = torch.sum(confidence >= threshold, dim=-1).cpu().tolist()
-            transfer_index = torch.split(col_indices, counts)
-        elif factor is not None:
-            # 1.b unmask top-n* tokens, where n* = argmax_{n} (n + 1)(1 - nth_largest_conf) < factor
-            num_unmasked_tokens = torch.sum(transfer_index_mask, dim=-1, keepdim=True)
-            for i in range(batch_size):
-                sorted_conf, _ = torch.sort(
-                    confidence[i][transfer_index_mask[i]],
-                    dim=-1,
-                    descending=True,
-                )
-                for n in range(1, num_unmasked_tokens[i] + 1):
-                    if (n + 1) * (1 - sorted_conf[n - 1]) >= factor:
-                        break
-                transfer_index[i] = torch.topk(confidence[i], n - 1, dim=-1).indices  # type: ignore
-
-        # check if there are too few tokens to be decoded in any sequence
-        # in this case, fall back to topk selection
-        confidence = confidence[
-            [
-                i
-                for i, t in enumerate(transfer_index)
-                if t.numel() < num_transfer_tokens[i]
-            ]
-        ]
-    if confidence.size(0) > 0:
-        # 2. select the tokens that have top-num_transfer_tokens highest probs as generated tokens
-        topk_transfer_index = [
-            torch.topk(
-                confidence[i],
-                int(torch.min(transfer_index_mask[i].sum(), num_transfer_tokens[i])),
-                dim=-1,
-            ).indices
-            for i in range(confidence.size(0))
-        ]
-        # put topk_transfer_index to rows that have fewer than num_transfer_tokens
-        source_iter = iter(topk_transfer_index)
-        transfer_index = [
-            next(source_iter) if t.numel() < num_transfer_tokens[i] else t
-            for i, t in enumerate(transfer_index)
-        ]
-
-    return tuple(transfer_index)
+from src.generation.vanilla import get_num_transfer_tokens, confidence_unmasking
 
 
 @torch.no_grad()
@@ -120,6 +17,10 @@ def generate_step(
     frame: Frame,
     block_mask: torch.Tensor,
     num_transfer_tokens: torch.Tensor | int,
+    # klass
+    prev_probs: torch.Tensor,
+    kl_history: torch.Tensor,
+    kl_threshold: float = 0.02,
     attention_mask: torch.Tensor | None = None,
     past_key_values: dCache | None = None,
     alg: str = "maskgit_plus",
@@ -128,9 +29,6 @@ def generate_step(
     top_k: float | None = None,
     mask_token_id: int = None,  # type: ignore
     sigma: float | None = None,
-    # PC sampler
-    debias: bool = False,
-    clip_alpha: float | None = None,
     # parallel decoding
     threshold: float | None = None,
     factor: float | None = None,
@@ -207,7 +105,7 @@ def generate_step(
         else:
             valid_mask = past_key_values.active_q_mask[:, prompt_length:]
         transfer_index_mask[can_generate].logical_and_(valid_mask)
-    logits = logits[:, prompt_length:]
+    logits = logits[:, prompt_length:].to(torch.float64)
 
     hidden_states = (
         tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
@@ -215,18 +113,12 @@ def generate_step(
         else None
     )
 
-    if debias:
-        global _token_freq
-        _token_freq = get_token_freq(model, device=logits.device, dtype=logits.dtype)
-
     # sampling tokens for all generated positions
     confidence, x0, p = sample_tokens(
         logits,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        debias=debias,
-        clip_alpha=clip_alpha,
         alg=alg,
     )
     scores = confidence = torch.where(
@@ -235,14 +127,46 @@ def generate_step(
     if sigma is not None and sigma > 0:
         scores = confidence * certainty_density(~remaining_mask, sigma=sigma)
 
-    # select tokens to transfer based on probs and mask
-    transfer_index = confidence_unmasking(
+    # ----------------------------- Klass-specific logic -----------------------------
+    eps = 1e-12
+    kl_current_prev = (
+        p * (torch.log(p + eps) - torch.log(prev_probs[can_generate] + eps))
+    ).sum(dim=-1)
+    # Shift kl_history and insert new KL at the end
+    active_index = torch.nonzero(can_generate, as_tuple=True)[0]
+    kl_history[active_index] = kl_history[active_index].roll(shifts=-1, dims=-1)
+    kl_history[active_index, ..., -1] = kl_current_prev
+
+    stable_mask = torch.zeros_like(transfer_index_mask)
+    stable_mask[active_index] = torch.all(
+        kl_history[active_index] < kl_threshold, dim=-1
+    )
+    failback_transfer_mask = transfer_index_mask & block_mask
+    stable_transfer_mask = failback_transfer_mask & stable_mask
+
+    # Case 1: select based on KL stability & confidence
+    ta = confidence_unmasking(
         scores=scores,
-        transfer_index_mask=(transfer_index_mask & block_mask)[can_generate],
-        num_transfer_tokens=num_transfer_tokens,
+        transfer_index_mask=stable_transfer_mask[can_generate],
+        num_transfer_tokens=torch.zeros_like(num_transfer_tokens),  # disable fallback
         threshold=threshold,
         factor=factor,
     )
+
+    # Case 2 (failback): select based on top-k confidence
+    tb = confidence_unmasking(
+        scores=scores,
+        transfer_index_mask=failback_transfer_mask[can_generate],
+        num_transfer_tokens=num_transfer_tokens,
+        threshold=None,  # disable parallel decoding
+        factor=None,
+    )
+
+    transfer_index = tuple(
+        ta_idx if ta_idx.numel() > 0 else tb_idx for ta_idx, tb_idx in zip(ta, tb)
+    )
+
+    # ----------------------------- Klass-specific end -----------------------------
     transfer_index_iter = iter(transfer_index)
     transfer_index = tuple(
         (
@@ -267,12 +191,13 @@ def generate_step(
         intermediate=Intermediate(
             hidden_states=hidden_states if hidden_states is not None else tuple()
         ),
+        extra=dict(curr_probs=p, active_index=active_index),
     )
     return delta.unbatch() if not frame.is_batched else delta
 
 
-@register.gen_strategy("vanilla")
-def vanilla_generate(
+@register.gen_strategy("klass")
+def klass_generate(
     model,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
@@ -286,9 +211,9 @@ def vanilla_generate(
     sigma: float | None = None,
     mask_token_id: int | None = None,
     pad_token_id: int | None = None,
-    # PC sampler
-    debias: bool = False,
-    clip_alpha: float | None = None,
+    # klass
+    kl_threshold: float = 0.01,
+    kl_history_length: int = 2,
     # parallel decoding
     threshold: float | None = None,
     factor: float | None = None,
@@ -297,22 +222,7 @@ def vanilla_generate(
     cache_cls: Type[dCache] | None = None,
 ) -> DecodeRecord:
     """
-    Vanilla generation for diffusion large language models.
-    Args:
-        model: Mask predictor.
-        input_ids: A tensor of shape (B, prompt_len).
-        steps: Sampling steps, less than or equal to gen_length.
-        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-        gen_length: Generated answer length.
-        temperature: Categorical distribution sampling temperature.
-        mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
-        top_k: The number of highest probability tokens to keep for one generation step.
-        top_p: The cumulative probability threshold for nucleus sampling.
-        sigma: The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
-        threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
-        factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
-        output_hidden_states: Whether to return the hidden states of all decoded tokens from layers.
-        output_probs: Whether to return the probs of all tokens.
+    KLASS generation strategy: KL-Adaptive Stability Sampling.
     """
 
     if mask_token_id is None and os.environ.get("MASK_TOKEN_ID", None) is None:
@@ -343,12 +253,23 @@ def vanilla_generate(
 
     cache = cache_cls(model.config) if cache_cls is not None else None
     frame = initial_frame
+    batch_size, prompt_length = input_ids.shape
 
     deltas = []
+    kl_history = torch.zeros(
+        (batch_size, gen_length, kl_history_length),
+        dtype=torch.float64,
+        device=model.device,
+    )
+    prev_probs = torch.zeros(
+        (batch_size, gen_length, model.config.vocab_size),
+        dtype=torch.float64,
+        device=model.device,
+    )
 
     for block_idx in range(num_blocks):
         block_mask = torch.zeros(
-            (input_ids.size(0), gen_length),
+            (batch_size, gen_length),
             dtype=torch.bool,
             device=model.device,
         )
@@ -370,6 +291,9 @@ def vanilla_generate(
                 frame=frame,
                 block_mask=block_mask,
                 num_transfer_tokens=num_transfer_tokens[:, i],
+                prev_probs=prev_probs,
+                kl_history=kl_history,
+                kl_threshold=kl_threshold,
                 attention_mask=attention_mask,
                 past_key_values=cache,
                 alg=alg,
@@ -378,8 +302,6 @@ def vanilla_generate(
                 top_k=top_k,
                 sigma=sigma,
                 mask_token_id=mask_token_id,
-                debias=debias,
-                clip_alpha=clip_alpha,
                 threshold=threshold,
                 factor=factor,
                 output_hidden_states=output_hidden_states,
@@ -388,6 +310,11 @@ def vanilla_generate(
             if delta is None:
                 # if no more mask tokens are left, break the loop
                 break
+
+            prev_probs[delta.extra["active_index"]] = delta.extra["curr_probs"]
+            delta.extra.pop("curr_probs")
+            delta.extra.pop("active_index")
+            delta = delta.to(dtype=model.dtype)
             if cache is not None:
                 cache.on_step_end(block_mask, frame, delta)
 

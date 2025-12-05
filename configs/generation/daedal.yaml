@@ -4,13 +4,13 @@ defaults:
   
 strategy: daedal
 
-# our param name           vs   official param name
+# our param name            vs   official param name
 # initial_gen_length        --   initial_gen_length
 # initial_eot_expand_thres  --   eos_confidence_threshold
-# decode_eot_expand_thres  --   expand_eos_confidence_threshold
-# low_conf_expand_thres    --   low_conf_threshold
-# threshold (in vanilla)   --   high_conf_threshold
-# max_gen_length           --   max_gen_length
+# decode_eot_expand_thres   --   expand_eos_confidence_threshold
+# low_conf_expand_thres     --   low_conf_threshold
+# threshold (in vanilla)    --   high_conf_threshold
+# max_gen_length            --   max_gen_length
 
 initial_gen_length: 64
 block_length: 32 # semi-ar is forced to be enabled

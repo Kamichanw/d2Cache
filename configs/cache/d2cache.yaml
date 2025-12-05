@@ -7,6 +7,5 @@ sigma: 10.0
 # inflate_w controls the width of inflation, only used in parallel+semi-AR decoding.
 inflate_w: 0
 
-# set to null to accumulate attention rollouts for all layers,
-# or a integer to accumulate only the first n layers
-num_rollout_layers: null 
+# block size for rollout selection
+rollout_block_size: 32
