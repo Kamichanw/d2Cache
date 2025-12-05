@@ -3,7 +3,7 @@
 
 accelerate launch \
     --num_machines 1 \
-    --num_processes 1 \
+    --num_processes 4 \
     eval.py \
     dataset.name=humaneval \
     batch_size=1 \

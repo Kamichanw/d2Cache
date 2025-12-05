@@ -125,6 +125,8 @@ accelerate launch \
     cache.rollour_p=0.1 \
     cache.current_k=32 \
     cache.sigma=10 \
+    cache.inflate_w=4 \
+    generation.sigma=0
 ```
 
 
