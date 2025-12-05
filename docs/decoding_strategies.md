@@ -71,7 +71,7 @@ accelerate launch \
     model=llada-inst 
 ```
 
-The factor based decoding proposed in Sec 3.3 is als implemented, to use this, add `generation.factor=1` to the command.
+The factor based decoding proposed in Sec 3.3 is also implemented, to use this, add `generation.factor=1` to the command.
 
 
 ## PC-Sampler: Position-Aware Calibration of Decoding Bias in Masked Diffusion Models

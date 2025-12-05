@@ -208,7 +208,6 @@ class dLLMCache(dCache):
         ), "All unfinished sequences must have the same refresh schedule."
 
         if refresh_prompt[can_generate].numel() > 0:
-            # all fisequences are
             self.refresh_prompt = refresh_prompt[can_generate][0].item()
             self.refresh_response = refresh_response[can_generate][0].item()
             self.can_generate = can_generate

@@ -103,7 +103,7 @@ accelerate launch \
     seed=1234 \
     attn_implementation=eager \
     cache=d2cache \
-    cache.rollour_p=0.1 \
+    cache.rollout_p=0.1 \
     cache.current_k=32 \
     cache.sigma=10 \
     generation=vanilla \

@@ -1,5 +1,4 @@
 import os
-import math
 import torch
 import torch.nn.functional as F
 
@@ -9,7 +8,6 @@ from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import prepare_logits_for_generation, sample_tokens
 from src.utils import certainty_density, register
-from src.third_party import get_token_freq
 from src.generation.vanilla import get_num_transfer_tokens, confidence_unmasking
 
 
@@ -131,13 +129,13 @@ def generate_step(
 
     # ----------------------------- Klass-specific logic -----------------------------
     eps = 1e-12
-    kl_current_prev = (p * (torch.log(p + eps) - torch.log(prev_probs + eps))).sum(
-        dim=-1
-    )
+    kl_current_prev = (
+        p * (torch.log(p + eps) - torch.log(prev_probs[can_generate] + eps))
+    ).sum(dim=-1)
     # Shift kl_history and insert new KL at the end
     active_index = torch.nonzero(can_generate, as_tuple=True)[0]
     kl_history[active_index] = kl_history[active_index].roll(shifts=-1, dims=-1)
-    kl_history[active_index, ..., -1] = kl_current_prev[active_index]
+    kl_history[active_index, ..., -1] = kl_current_prev
 
     stable_mask = torch.zeros_like(transfer_index_mask)
     stable_mask[active_index] = torch.all(
