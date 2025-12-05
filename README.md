@@ -3,8 +3,28 @@
 Codebase for Diffusion Language Models Research
 </p>
 <p align="center">
-<img src="./assets/logo.png" >
+<img src="./assets/logo.png" width="400">
 </p>
+
+<div align="center">
+<p align="center">
+      <a href="https://github.com/Kamichanw/d2Cache/stargazers">
+        <img alt="GitHub stars" src="https://img.shields.io/github/stars/Kamichanw/d2Cache?color=ccf" />
+      </a>
+      <a href="https://github.com/Kamichanw/d2Cache/issues">
+        <img alt="Issues" src="https://img.shields.io/github/issues/Kamichanw/d2Cache?color=0088ff" />
+      </a>
+      <a href="https://github.com/Kamichanw/d2Cache/discussions">
+        <img alt="Issues" src="https://img.shields.io/github/discussions/Kamichanw/d2Cache?color=0088ff" />
+      </a>
+      <a href="https://github.com/Kamichanw/d2Cache/pulls">
+        <img alt="GitHub pull requests" src="https://img.shields.io/github/issues-pr/Kamichanw/d2Cache?color=0088ff" />
+      </a>
+</p>
+</div>
+
+<hr>
+
 
 **Research dLLM** is a research-focused library for Diffusion Language Models (dLLMs), providing a comprehensive collection of baseline methods (primarily KV caching and decoding strategies) for reproducible experiments.
 
@@ -25,8 +45,8 @@ The corresponding usages can be found [here](./docs/kv_caching.md).
 
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|
-| PrefixCache / DualCache | <a href="https://arxiv.org/abs/2505.22618"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/maomaocun/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-Fast--dLLM-blue"></a> |
-| dLLM Cache | <a href="https://arxiv.org/abs/2506.06295"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2506.06295-red"></a> | <a href="https://github.com/maomaocun/dLLM-Cache"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-dLLM--Cache-blue"></a> |
+| PrefixCache / DualCache | <a href="https://arxiv.org/abs/2505.22618"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/NVLabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
+| dLLM Cache | <a href="https://arxiv.org/abs/2506.06295"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2506.06295-red"></a> | <a href="https://github.com/maomaocun/dLLM-Cache"><img alt="Static Badge" src="https://img.shields.io/github/stars/maomaocun/dLLM-Cache?style=social&label=Stars"></a> |
 | d2Cache | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2509.23094-red"></a> | This Repo |
 
 ## Decoding Strategies
@@ -34,12 +54,12 @@ The corresponding usages can be found [here](./docs/decoding_strategies.md).
 
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|
-| Vanilla / Semi-AR | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2502.09992-red"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-LLaDA-blue"></a> |
-| Parallel | <a href="https://arxiv.org/abs/2505.22618"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-Fast--dLLM-blue"></a> |
-| PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.13021-red"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-PC--Sampler-blue"></a> |
+| Vanilla / Semi-AR | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
+| Parallel | <a href="https://arxiv.org/abs/2505.22618"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVlabs/Fast-dLLM?style=social&label=Stars"></a> |
+| PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.13021-red"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/github/stars/NEUIR/PC-Sampler?style=social&label=Stars"></a> |
 | Certainty Prior Decoding | <a href="https://arxiv.org/abs/2509.23094"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2509.23094-red"></a> | This Repo|
-|DAEDAL |<a href="https://arxiv.org/abs/2508.00819"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.00819-red"></a> | <a href="https://github.com/Li-Jinsong/DAEDAL"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-DAEDAL-blue"></a> |
-| KLASS (WIP)| <a href="https://arxiv.org/abs/2511.05664"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2511.05664-red"></a> | <a href="https://github.com/shkim0116/KLASS"><img alt="Static Badge" src="https://img.shields.io/badge/GitHub-KLASS-blue"></a> |
+|DAEDAL |<a href="https://arxiv.org/abs/2508.00819"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.00819-red"></a> | <a href="https://github.com/Li-Jinsong/DAEDAL"><img alt="Static Badge" src="https://img.shields.io/github/stars/Li-Jinsong/DAEDAL?style=social&label=Stars"></a> |
+| KLASS | <a href="https://arxiv.org/abs/2511.05664"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Spotlight-2511.05664-purple"></a> | <a href="https://github.com/shkim0116/KLASS"><img alt="Static Badge" src="https://img.shields.io/github/stars/shkim0116/KLASS?style=social&label=Stars"></a> |
 # Setup
 ```bash
 # Create and activate the environment
@@ -73,6 +93,11 @@ Available datasets:
 - ... (all tasks specified in `lm-eval` are available)
 
 Additional general arguments can be specified in `configs/geneation/*.yaml` or `configs/gen_args.py`.
+
+# Starchart
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Kamichanw/d2Cache&type=Date)](https://star-history.com/#Kamichanw/d2Cache&Date)
+
 
 # Citation
 If you find d²Cache or this repository useful for your research and applications, please cite using this BibTeX:

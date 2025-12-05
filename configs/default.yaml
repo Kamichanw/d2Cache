@@ -6,7 +6,7 @@ defaults:
 
 seed: 42
 batch_size: ${dataset.batch_size}
-attn_implementation: "eager" # sdpa or eager
+attn_implementation: "sdpa" # sdpa or eager
 dataset:
     name: null # make sure the name is in lm-eval task list
     size: null

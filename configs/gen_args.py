@@ -15,8 +15,6 @@ class GenerationArgs(BaseModel):
     top_k: int | None = Field(default=None, ge=0)
     top_p: float | None = Field(default=None, gt=0, le=1)
     sigma: float | None = Field(default=None, gt=0)
-    threshold: float | None = Field(default=None)
-    debias: bool = Field(default=False)
 
     cache_args: dict = Field(default_factory=dict)
 
@@ -40,9 +38,7 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
     alg = "maskgit_plus"
     block_length = None
     sigma = None
-    debias = False
     temperature, top_p, top_k = 0.0, None, None
-    threshold = None
 
     # set based on task
     match task:
@@ -163,7 +159,5 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
         top_k=top_k,
         top_p=top_p,
         sigma=sigma,
-        threshold=threshold,
-        debias=debias,
         cache_args=cache_args,
     )

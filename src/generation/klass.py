@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.nn.functional as F
 
@@ -193,7 +194,7 @@ def generate_step(
             hidden_states=hidden_states if hidden_states is not None else tuple()
         ),
         extra=dict(curr_probs=p, active_index=active_index),
-    ).to(model.dtype)
+    )
     return delta.unbatch() if not frame.is_batched else delta
 
 
@@ -311,9 +312,11 @@ def klass_generate(
             if delta is None:
                 # if no more mask tokens are left, break the loop
                 break
-            prev_probs[delta.extra["active_index"]] = delta.extra["curr_probs"].to(torch.float64)
+
+            prev_probs[delta.extra["active_index"]] = delta.extra["curr_probs"]
             delta.extra.pop("curr_probs")
             delta.extra.pop("active_index")
+            delta = delta.to(dtype=model.dtype)
             if cache is not None:
                 cache.on_step_end(block_mask, frame, delta)
 
