@@ -28,8 +28,6 @@ class Base(BaseModel):
         """
         Converts the model to a specific device and dtype. The `dtype` is only used for floating point tensors.
         """
-        if isinstance(device, torch.dtype):
-            dtype, device = device, dtype  # type: ignore
 
         def to(t):
             if isinstance(t, torch.Tensor) or hasattr(t, "to"):

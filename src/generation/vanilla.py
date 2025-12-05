@@ -191,7 +191,11 @@ def generate_step(
     attention_mask = (
         attention_mask[can_generate] if attention_mask is not None else None
     )
-    num_transfer_tokens = num_transfer_tokens[can_generate]
+    num_transfer_tokens = (
+        num_transfer_tokens[can_generate]
+        if isinstance(num_transfer_tokens, torch.Tensor)
+        else num_transfer_tokens
+    )
     outputs = model(
         x,
         attention_mask=attention_mask,

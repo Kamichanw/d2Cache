@@ -120,9 +120,5 @@ def sample_tokens(
         confidence = torch.sum(probs * log_probs, dim=-1)
     elif alg == "random":
         confidence = torch.rand_like(confidence)
-    elif alg == "maskgit_plus":
-        pass  # default behavior
-    else:
-        raise ValueError(f"Unknown algorithm: {alg}")
 
     return confidence, x0, probs
