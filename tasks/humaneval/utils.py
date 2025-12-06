@@ -1,23 +1,36 @@
-# Modified from Dream repos: https://github.com/HKUNLP/Dream
-"""Post-processing LLM-generated Python code implemented using tree-sitter."""
-
-import os
-import sys
-
-ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.extend([os.path.dirname(ROOT), os.path.dirname(os.path.dirname(ROOT))])
-
 import ast
 import traceback
+import evaluate as hf_evaluate
 
-from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    compute_ = hf_evaluate.load("code_eval")
+    test_cases = ["assert add(2, 3)==5"]
+    candidates = [["def add(a,b): return a*b"]]
+    results = compute_.compute(references=test_cases, predictions=candidates, k=[1])
+except Exception as e:
+    raise e
+
+
+def pass_at_k(references: list[str], predictions: list[list[str]], k: list[int] = None):
+    global compute_
+    assert k is not None
+    if isinstance(k, int):
+        k = [k]
+    res = compute_.compute(
+        references=references,
+        predictions=predictions,
+        k=k,
+    )
+    return res[0]
 
 def refine_text(text: str) -> str:
-    text =  text.replace("\t", "    ")
+    text = text.replace("\t", "    ")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return text.strip() + "\n"
 
-def syntax_check(code, verbose = False):
+
+def syntax_check(code, verbose=False):
     try:
         ast.parse(code)
         return True
@@ -25,6 +38,7 @@ def syntax_check(code, verbose = False):
         if verbose:
             traceback.print_exc()
         return False
+
 
 def extract_longest_valid_code(text: str) -> str:
     lines = text.splitlines()
@@ -36,16 +50,17 @@ def extract_longest_valid_code(text: str) -> str:
 
     for i in range(len(lines)):
         for j in range(i, len(lines)):
-            current_snippet = "\n".join(lines[i:j+1])
+            current_snippet = "\n".join(lines[i : j + 1])
             if syntax_check(current_snippet):
-                valid_line_count = sum(1 for line in lines[i:j+1] if line.strip())
+                valid_line_count = sum(1 for line in lines[i : j + 1] if line.strip())
                 if valid_line_count > max_valid_lines:
                     max_valid_lines = valid_line_count
                     max_valid_snippet = current_snippet
 
     return max_valid_snippet
 
-def get_deps(nodes: List[Tuple[str, ast.AST]]) -> Dict[str, Set[str]]:
+
+def get_deps(nodes: list[tuple[str, ast.AST]]) -> dict[str, set[str]]:
     name2deps = {}
     for name, node in nodes:
         deps = set()
@@ -62,7 +77,10 @@ def get_deps(nodes: List[Tuple[str, ast.AST]]) -> Dict[str, Set[str]]:
         name2deps[name] = deps
     return name2deps
 
-def get_function_dependency(entrypoint: str, call_graph: Dict[str, Set[str]]) -> Set[str]:
+
+def get_function_dependency(
+    entrypoint: str, call_graph: dict[str, set[str]]
+) -> set[str]:
     visited = set()
     to_visit = [entrypoint]
 
@@ -74,7 +92,8 @@ def get_function_dependency(entrypoint: str, call_graph: Dict[str, Set[str]]) ->
 
     return visited
 
-def get_definition_name(node: ast.AST) -> Optional[str]:
+
+def get_definition_name(node: ast.AST) -> str | None:
     if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
         return node.name
     elif isinstance(node, ast.Assign):
@@ -83,10 +102,12 @@ def get_definition_name(node: ast.AST) -> Optional[str]:
             return targets[0].id
     return None
 
+
 def has_return_statement(node: ast.AST) -> bool:
     return any(isinstance(n, ast.Return) for n in ast.walk(node))
 
-def sanitize(text: str, entrypoint: Optional[str] = None) -> str:
+
+def sanitize(text: str, entrypoint: str) -> str:
 
     text = refine_text(text)
 
@@ -94,7 +115,7 @@ def sanitize(text: str, entrypoint: Optional[str] = None) -> str:
 
     code = extract_longest_valid_code(text)
     tree = ast.parse(code)
-    
+
     definitions = {}
 
     imports = []
@@ -104,15 +125,15 @@ def sanitize(text: str, entrypoint: Optional[str] = None) -> str:
             imports.append(node)
         elif isinstance(node, ast.ClassDef):
             name = node.name
-            definitions[name] = ('class', node)
+            definitions[name] = ("class", node)
         elif isinstance(node, ast.FunctionDef):
             name = node.name
             if has_return_statement(node):
-                definitions[name] = ('function', node)
+                definitions[name] = ("function", node)
         elif isinstance(node, ast.Assign):
             name = get_definition_name(node)
             if name:
-                definitions[name] = ('variable', node)
+                definitions[name] = ("variable", node)
 
     reachable = []
     if entrypoint:
@@ -129,3 +150,28 @@ def sanitize(text: str, entrypoint: Optional[str] = None) -> str:
             sanitized_output.append(ast.unparse(node))
 
     return "\n".join(sanitized_output)
+
+def postprocess_code(doc, code: str) -> str:
+    if "```python" in code and code.find("```python") == code.find("```"):
+        # if ```python ``` is the first code block, extract the first
+        code = code.split("```python", 1)[-1]
+        if code.startswith("\n"):
+            code = code[1:]
+
+    # take code until the next ```
+    code = code.split("```", 1)[0]
+
+    return sanitize(
+        doc["prompt"] + "\n" + code,
+        doc["entry_point"],
+    )
+
+
+def build_predictions(resps: list[list[str]], docs: list[dict]) -> list[list[str]]:
+    return [[postprocess_code(doc, r) for r in resp] for resp, doc in zip(resps, docs)]
+
+
+def build_predictions_instruct(
+    resps: list[list[str]], docs: list[dict]
+) -> list[list[str]]:
+    return [[postprocess_code(doc, r) for r in resp] for resp, doc in zip(resps, docs)]

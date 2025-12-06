@@ -178,7 +178,7 @@ accelerate launch \
     --num_machines 1 \
     --num_processes 4 \
     eval.py \
-    dataset.name=humaneval \
+    dataset.name=humaneval_instruct \
     batch_size=8 \
     seed=1234 \
     generation=daedal \

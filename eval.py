@@ -11,7 +11,7 @@ from typing import cast
 from hydra.core.hydra_config import HydraConfig
 from loguru import logger
 from lm_eval.evaluator import simple_evaluate
-from lm_eval.tasks import ConfigurableTask, get_task_dict, TaskManager
+from lm_eval.tasks import TaskManager
 
 from src.eval_model import load_eval_model
 from src.utils import pre_initialize, Timer, sympy_antlr_patcher
@@ -34,28 +34,17 @@ def serializer(o):
     return f"<unserializable object of type {o.__class__.__name__}>"
 
 
-dream_inst_humaneval = {
-    "doc_to_text": "Write a solution to the following problem and make sure that it passes the tests:\n```{{prompt}}",
-    "gen_prefix": "Here is the completed function:\n```python\n{{prompt}}\n",
-}
-
-
 def overwrite_eval_task(cfg: DictConfig):
     eval_args = cast(dict, OmegaConf.to_container(cfg.eval_args, resolve=True))
-    if cfg.dataset.name == "humaneval" and cfg.model.name == "dream-inst":
-        # see https://github.com/DreamLM/Dream/blob/main/eval_instruct/lm_eval/tasks/humaneval/humaneval_instruct.yaml
-        task: ConfigurableTask = get_task_dict("humaneval")["humaneval"]
-        task.config.doc_to_text = "Write a solution to the following problem and make sure that it passes the tests:\n```{{prompt}}"
-        task.config.gen_prefix = (
-            "Here is the completed function:\n```python\n{{prompt}}\n"
-        )
-        eval_args["tasks"] = [task]
 
-    if cfg.dataset.name == "math-500":
-        task_manager = TaskManager(
-            include_path=str(Path(__file__).parent / "tasks" / "math-500")
-        )
-        eval_args["task_manager"] = task_manager
+    task_manager = TaskManager(
+        include_path=[
+            str(path)
+            for dirname in os.listdir(Path(__file__).parent / "tasks")
+            if os.path.isdir(path := Path(__file__).parent / "tasks" / dirname)
+        ]
+    )
+    eval_args["task_manager"] = task_manager
 
     return eval_args
 

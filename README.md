@@ -39,6 +39,8 @@ Codebase for Diffusion Language Models Research
 
 [25/10/13] Now, batch inference is supported!
 
+[25/12/06] 🚀 We are looking for help to reproduce our experimental results using A100 GPUs. Please contact us if you can assist with the benchmarking.
+
 # Supported Methods
 The corresponding usages can be found [here](./docs/kv_caching.md).
 ## KV Caching
@@ -87,12 +89,15 @@ Available models:
 
 Available datasets:
 - gsm8k
-- humaneval
+- humaneval / humaneval_instruct
 - math-500
-- mbpp
+- mbpp / mbpp_instruct
 - ... (all tasks specified in `lm-eval` are available)
 
-Additional general arguments can be specified in `configs/geneation/*.yaml` or `configs/gen_args.py`.
+> [!IMPORTANT]
+> To evaluate humaneval and mbpp dataset on instruct fine-tuned models, please use their corresponding instruct variants, i.e., `humaneval_instruct` and `mbpp_instruct` for better post processing.
+
+Additional general arguments can be specified in `configs/generation/*.yaml` or `configs/gen_args.py`.
 
 # Starchart
 

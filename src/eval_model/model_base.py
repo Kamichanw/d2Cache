@@ -16,7 +16,6 @@ from tqdm import tqdm
 from src.frame import Frame
 from src.generation import generate, decode_final_frame
 from src.utils import Timer, load_pretrained_model
-from src.eval_model.sanitize import sanitize
 
 
 class EvalModelBase(TemplateLM):
@@ -60,23 +59,6 @@ class EvalModelBase(TemplateLM):
         self.input_length = None
         self.device = self.accelerator.device
         self.extra_gen_kwargs = kwargs.get("extra_gen_kwargs", {})
-
-        if (drafter := self.extra_gen_kwargs.get("drafter")) is not None:
-            if drafter == "self":
-                self.extra_gen_kwargs["drafter"] = self.model
-            else:
-                self.extra_gen_kwargs["drafter"] = drafter.eval().to(
-                    self.accelerator.device
-                )
-
-    def postprocess_code(self, doc, code: str) -> str:
-        code = code.split("```python\n", 1)[-1].split("```")[0]
-        if "entry_point" in doc:
-            return sanitize(
-                doc["prompt"] + "\n" + code,
-                doc["entry_point"],
-            )
-        return code
 
     def tok_encode(self, string: str, **kwargs):
         return self.tokenizer(string, **kwargs).input_ids
@@ -130,8 +112,15 @@ class EvalModelBase(TemplateLM):
             disable=disable_tqdm or not self.accelerator.is_main_process,
         ):
             context, until = map(list, zip(*(instance.args for instance in instances)))
-            if self.cfg.generation.get("add_bos_token", False):
-                context = [self.tokenizer.bos_token + ctx for ctx in context]
+            if self.cfg.get("add_bos_token", False):
+                context = [
+                    (
+                        self.tokenizer.bos_token + ctx
+                        if not ctx.startswith(self.tokenizer.bos_token)
+                        else ctx
+                    )
+                    for ctx in context
+                ]
             inputs = self.tokenizer(
                 context, return_tensors="pt", padding=True, padding_side="left"
             )
@@ -169,11 +158,6 @@ class EvalModelBase(TemplateLM):
                     )
                     for i, u in enumerate(until)
                 ]
-                if self.cfg.dataset.name in ["humaneval", "mbpp"]:
-                    generated_answer = [
-                        self.postprocess_code(instance.doc, answer)
-                        for instance, answer in zip(instances, generated_answer)
-                    ]
 
                 out.extend(generated_answer)
             except torch.cuda.OutOfMemoryError:
