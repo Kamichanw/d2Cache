@@ -95,7 +95,7 @@ Available datasets:
 - ... (all tasks specified in `lm-eval` are available)
 
 > [!IMPORTANT]
-> To evaluate humaneval and mbpp dataset on instruct fine-tuned models, please use their corresponding instruct variants, i.e., `humaneval_instruct` and `mbpp_instruct` for better post processing.
+> To evaluate humaneval dataset on Dream-v0-Instruct-7B, please use its corresponding instruct variants, i.e., `humaneval_instruct`.
 
 Additional general arguments can be specified in `configs/generation/*.yaml` or `configs/gen_args.py`.
 

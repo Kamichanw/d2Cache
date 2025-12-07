@@ -8,4 +8,4 @@ sigma: 10.0
 inflate_w: 0
 
 # block size for rollout selection
-rollout_block_size: 32
+rollout_block_size: 1
