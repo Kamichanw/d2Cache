@@ -17,7 +17,6 @@ class d2Cache(dCache):
         current_k: int = 32,
         sigma: float = 10.0,
         inflate_w: int = 4,
-        rollout_block_size: int = 1,
     ):
         super().__init__(model_config)
         self.key_cache: list[torch.Tensor] = []
@@ -30,7 +29,6 @@ class d2Cache(dCache):
         self.current_k = current_k
         self.sigma = sigma
         self.inflate_w = inflate_w
-        self.rollout_block_size = rollout_block_size
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
@@ -252,32 +250,7 @@ class d2Cache(dCache):
 
         # 3. for other tokens, select top-k tokens based on attention rollout
         global_importance = self._attn_rollout.sum(dim=1)
-        if self.rollout_block_size > 1:
-            B_active, T = global_importance.shape
-            pad_len = (
-                self.rollout_block_size - T % self.rollout_block_size
-            ) % self.rollout_block_size
-
-            # sum pooling for importance
-            pooled_importance = (
-                F.pad(global_importance, (0, pad_len))
-                .view(B_active, -1, self.rollout_block_size)
-                .sum(dim=-1)
-            )
-
-            # we want block to be candidate if ANY token is candidate.
-            pooled_candidate_mask = (
-                (~F.pad(q_mask, (0, pad_len), value=True))
-                .view(B_active, -1, self.rollout_block_size)
-                .any(dim=-1)
-            )
-
-            rollout_mask = nucleus_select(
-                pooled_importance, self.rollout_p, mask=pooled_candidate_mask
-            ).repeat_interleave(self.rollout_block_size, dim=-1)
-            q_mask |= rollout_mask[:, :T]
-        else:
-            q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
+        q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
 
         if self.model_config.model_type.lower() == "dream":
             # if the first mask token is selected, we need to select the token before it
