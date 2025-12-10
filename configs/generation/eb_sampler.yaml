@@ -1,0 +1,5 @@
+defaults:
+  - vanilla
+  - _self_
+
+gamma: 0.001

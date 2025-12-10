@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
-
+import torch.distributions as dists
 from typing import Type
 
 from src.cache import dCache
@@ -48,8 +48,12 @@ def confidence_unmasking(
     scores: torch.Tensor,
     transfer_index_mask: torch.Tensor,
     num_transfer_tokens: torch.Tensor,
+    # parallel decoding
     threshold: float | torch.Tensor | None = None,
     factor: float | None = None,
+    # EB sampler
+    gamma: float | None = None,
+    p: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """
     Select tokens to be fixed based on token probs, i.e., confidence.
@@ -60,7 +64,15 @@ def confidence_unmasking(
         num_transfer_tokens: A tensor of shape [B,] indicating the number of tokens to be transferred at each step.
         threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
         factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
+        gamma: threshold of upper bound of joint dependence error, see https://arxiv.org/pdf/2505.24857.
+        p: A tensor of shape [B, gen_length, vocab_size] containing the probabilities of each token. Must be provided if using EB sampler.
     """
+
+    if (threshold is not None) + (factor is not None) + (gamma is not None) > 1:
+        raise ValueError(
+            "Only one of `threshold`, `factor`, or `gamma` should be provided."
+        )
+
     batch_size, _ = scores.shape
 
     confidence = torch.where(transfer_index_mask, scores, -torch.inf)
@@ -94,6 +106,18 @@ def confidence_unmasking(
                 if t.numel() < num_transfer_tokens[i]
             ]
         ]
+    elif gamma is not None:
+        # 1.c EB sampler: select tokens based on entropy bound
+        if p is None:
+            raise ValueError(
+                "Probabilities of all tokens `p` must be provided for EB sampler."
+            )
+        _, ids = torch.sort(confidence, dim=-1, descending=True)
+        entropy = torch.gather(dists.Categorical(probs=p.float()).entropy(), dim=-1, index=ids)
+        acc_entropy = torch.cumsum(entropy, dim=1)
+        cummax_entropy = torch.cummax(entropy, dim=0).values
+        num_transfer_tokens = (acc_entropy - cummax_entropy <= gamma).sum(dim=1)
+
     if confidence.size(0) > 0:
         # 2. select the tokens that have top-num_transfer_tokens highest probs as generated tokens
         topk_transfer_index = [
@@ -128,6 +152,8 @@ def generate_step(
     top_k: float | None = None,
     mask_token_id: int = None,  # type: ignore
     sigma: float | None = None,
+    # EB sampler
+    gamma: float | None = None,
     # PC sampler
     debias: bool = False,
     clip_alpha: float | None = None,
@@ -154,11 +180,6 @@ def generate_step(
         output_hidden_states: Whether to return the hidden states of all decoded tokens.
         output_probs: Whether to return the probabilities of the decoded tokens.
     """
-    if threshold is not None and factor is not None:
-        raise ValueError(
-            "Only one of `threshold` or `factor` can be specified, not both."
-        )
-
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
 
@@ -242,6 +263,8 @@ def generate_step(
         num_transfer_tokens=num_transfer_tokens,
         threshold=threshold,
         factor=factor,
+        gamma=gamma,
+        p=p,
     )
     transfer_index_iter = iter(transfer_index)
     transfer_index = tuple(
@@ -286,6 +309,8 @@ def vanilla_generate(
     sigma: float | None = None,
     mask_token_id: int | None = None,
     pad_token_id: int | None = None,
+    # EB sampler
+    gamma: float | None = None,
     # PC sampler
     debias: bool = False,
     clip_alpha: float | None = None,
@@ -377,6 +402,7 @@ def vanilla_generate(
                 top_p=top_p,
                 top_k=top_k,
                 sigma=sigma,
+                gamma=gamma,
                 mask_token_id=mask_token_id,
                 debias=debias,
                 clip_alpha=clip_alpha,
