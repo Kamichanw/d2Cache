@@ -1,0 +1,7 @@
+defaults:
+  - vanilla
+  - _self_
+
+strategy: "wino"
+wide_in_thres: 0.6
+narrow_out_thres: 0.9

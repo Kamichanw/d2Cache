@@ -56,7 +56,8 @@ def main(cfg: DictConfig) -> None:
     output_dir = HydraConfig.get().runtime.output_dir
 
     patcher_ctx = sympy_antlr_patcher if cfg.dataset.name == "math-500" else nullcontext
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     with patcher_ctx():
         results = simple_evaluate(
             model=model,
@@ -66,7 +67,12 @@ def main(cfg: DictConfig) -> None:
             apply_chat_template=cfg.model.name.endswith("inst"),
             **overwrite_eval_task(cfg),
         )
-    peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024**3)
+
+    peak_memory_allocated = (
+        torch.cuda.max_memory_allocated() / (1024**3)
+        if torch.cuda.is_available()
+        else 0.0
+    )
 
     results_path = os.path.join(output_dir, "results.json")
 

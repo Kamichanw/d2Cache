@@ -148,7 +148,7 @@ def generate_step(
     ta = confidence_unmasking(
         scores=scores,
         transfer_index_mask=stable_transfer_mask[can_generate],
-        num_transfer_tokens=torch.zeros_like(num_transfer_tokens),  # disable fallback
+        min_transfer_tokens=torch.zeros_like(num_transfer_tokens),  # disable fallback
         threshold=threshold,
         factor=factor,
     )
@@ -157,7 +157,7 @@ def generate_step(
     tb = confidence_unmasking(
         scores=scores,
         transfer_index_mask=failback_transfer_mask[can_generate],
-        num_transfer_tokens=num_transfer_tokens,
+        min_transfer_tokens=num_transfer_tokens,
         threshold=None,  # disable parallel decoding
         factor=None,
     )
@@ -177,7 +177,7 @@ def generate_step(
         for is_not_finished in can_generate
     )
 
-    delta = FrameDelta(
+    return FrameDelta(
         transfer_index=transfer_index,
         decoded_tokens=torch.where(
             transfer_index_mask[can_generate], x0, INVALID_TOKEN_ID
@@ -193,7 +193,6 @@ def generate_step(
         ),
         extra=dict(curr_probs=p, active_index=active_index),
     )
-    return delta.unbatch() if not frame.is_batched else delta
 
 
 @register.gen_strategy("klass")
