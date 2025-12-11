@@ -135,7 +135,10 @@ def wino_generate_step(
     # Unmasking (Wide In)
     scores = torch.where(block_mask_curr, confidence, -torch.inf)
     if sigma is not None and sigma > 0:
-        scores = confidence * certainty_density(~remaining_mask, sigma=sigma)
+        scores = (
+            confidence
+            * certainty_density(~remaining_mask, sigma=sigma)[:, block_start:block_end]
+        )
     selected_indices = confidence_unmasking(
         scores=scores,
         transfer_index_mask=block_mask_curr,
