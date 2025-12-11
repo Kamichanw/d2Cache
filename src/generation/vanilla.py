@@ -98,14 +98,14 @@ def confidence_unmasking(
             # 1.a select all tokens whose confidence is above the threshold
             col_indices = torch.nonzero(confidence >= threshold, as_tuple=False)[:, 1]
             counts = torch.sum(confidence >= threshold, dim=-1).cpu().tolist()
-            transfer_index = torch.split(col_indices, counts)
+            transfer_index = list(torch.split(col_indices, counts))
             # check if there are too many tokens to be decoded in any sequence
             # in this case, we only keep the top-k tokens with highest confidence
             # to do so, we simply clear the transfer_index for those sequences and faill back to top-k selection later
-            transfer_index = list(
-                (t if t.numel() <= max_transfer_tokens[i] else torch.tensor([]))
-                for i, t in enumerate(transfer_index)
-            )
+            for i, t in enumerate(transfer_index):
+                if t.numel() > max_transfer_tokens[i]:
+                    transfer_index[i] = torch.tensor([])
+                    num_transfer_tokens[i] = max_transfer_tokens[i]
         elif factor is not None:
             # 1.b unmask top-n* tokens, where n* = argmax_{n} (n + 1)(1 - nth_largest_conf) < factor
             num_unmasked_tokens = torch.sum(transfer_index_mask, dim=-1, keepdim=True)

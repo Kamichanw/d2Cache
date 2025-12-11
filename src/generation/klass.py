@@ -310,9 +310,7 @@ def klass_generate(
                 # if no more mask tokens are left, break the loop
                 break
 
-            prev_probs[delta.extra["active_index"]] = delta.extra["curr_probs"]
-            delta.extra.pop("curr_probs")
-            delta.extra.pop("active_index")
+            prev_probs[delta.extra.pop("active_index")] = delta.extra.pop("curr_probs")
             delta = delta.to(dtype=model.dtype)
             if cache is not None:
                 cache.on_step_end(block_mask, frame, delta)

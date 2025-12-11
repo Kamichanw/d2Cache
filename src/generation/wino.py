@@ -26,7 +26,7 @@ def wino_generate_step(
     # wino
     wide_in_thres: float = 0.6,
     narrow_out_thres: float = 0.9,
-    last_accept: torch.Tensor | None = None,
+    num_last_wide_in: torch.Tensor = None,  # type: ignore
     output_hidden_states: bool = False,
     output_probs: bool = False,
 ) -> FrameDelta | None:
@@ -125,11 +125,8 @@ def wino_generate_step(
         alg=alg,
     )
 
-    current_tokens = generated_active[:, block_start:block_end]
     # for masked positions, sample_tokens' confidence already matches x0; for unmasked, gather current tokens.
-    current_conf = torch.gather(p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(
-        -1
-    )
+    current_conf = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
     confidence = torch.where(block_mask_curr, combined_conf, current_conf)
 
     # Unmasking (Wide In)
@@ -152,58 +149,53 @@ def wino_generate_step(
     )
 
     unmask_mask_block = torch.zeros_like(block_mask_curr, dtype=torch.bool)
-    for b, idx in enumerate(selected_indices):
+    for i, idx in enumerate(selected_indices):
         if idx.numel() > 0:
-            unmask_mask_block[b, idx.long()] = True
+            unmask_mask_block[i, idx.long()] = True
 
     unmask_mask = torch.zeros_like(transfer_index_mask[can_generate], dtype=torch.bool)
     unmask_mask[:, block_start:block_end] = unmask_mask_block
 
     # Remasking (Narrow Out)
     remask_mask = torch.zeros_like(unmask_mask)
-    if last_accept is not None:
-        active_last_accept = last_accept[can_generate]
-        # only consider samples that have unmasked at least one token
-        can_remask = unmask_mask.sum(dim=1) > 1
+    active_num_last_wide_in = num_last_wide_in[can_generate]
+    num_last_wide_in[can_generate] = unmask_mask_block.sum(dim=1)
+    # only consider samples that have unmasked at least one token
+    can_remask = unmask_mask.sum(dim=1) > 1
 
-        # use shadow block probs for already-unmasked tokens
-        shadow_conf = torch.where(
-            ~block_mask_curr,
-            confidence,
-            torch.tensor(float("inf"), device=device),
-        )
+    # use shadow block probs for already-unmasked tokens
+    shadow_conf = torch.where(~block_mask_curr, confidence, torch.inf)
 
-        for b in range(active_batch_size):
-            if not can_remask[b]:
-                continue
+    for i in range(active_batch_size):
+        if not can_remask[i]:
+            continue
 
-            row_conf = shadow_conf[b]
-            row_remask = row_conf < narrow_out_thres
+        row_conf = shadow_conf[i]
+        row_remask = row_conf < narrow_out_thres
 
-            target_k = int(active_last_accept[b].item()) - 1
-            if target_k > 0 and row_remask.sum() >= active_last_accept[b]:
-                # select bottom-k to remask, only when k is valid
-                _, idx = torch.topk(
-                    row_conf.view(-1),
-                    k=target_k,
-                    largest=False,
-                )
-                row_remask = (
-                    torch.zeros_like(row_remask)
-                    .view(-1)
-                    .scatter_(0, idx, True)
-                    .view_as(row_remask)
-                )
+        target_k = int(active_num_last_wide_in[i].item()) - 1
+        if target_k > 0 and row_remask.sum() >= active_num_last_wide_in[i]:
+            # select bottom-k to remask, only when k is valid
+            _, idx = torch.topk(row_conf.view(-1), k=target_k, largest=False)
+            row_remask = (
+                torch.zeros_like(row_remask)
+                .view(-1)
+                .scatter_(0, idx, True)
+                .view_as(row_remask)
+            )
 
-            remask_mask[b, block_start:block_end] = row_remask
+        remask_mask[i, block_start:block_end] = row_remask
 
     # construct delta
     decoded_tokens = torch.full_like(generated_active, INVALID_TOKEN_ID)
     decoded_tokens[:, block_start:block_end].masked_scatter_(
         block_mask_curr, x0[block_mask_curr]
     )
+    decoded_tokens[remask_mask] = mask_token_id
 
-    total_mask = unmask_mask & ~remask_mask
+    total_mask = (
+        unmask_mask | remask_mask
+    )  # we need to transfer remasking tokens as well
     active_transfer_index = tuple(
         torch.nonzero(total_mask[i], as_tuple=False).squeeze(-1)
         for i in range(active_batch_size)
@@ -225,6 +217,7 @@ def wino_generate_step(
     confidence_ext[:, block_start:block_end].masked_scatter_(
         block_mask_curr, confidence[block_mask_curr]
     )
+    confidence_ext[remask_mask] = 1.0
 
     probs_ext = None
     if output_probs:
@@ -237,6 +230,9 @@ def wino_generate_step(
         probs_ext[:, block_start:block_end] = torch.where(
             block_mask_curr.unsqueeze(-1), p, -torch.inf
         )
+        fake_prob = torch.zeros((p.size(-1),), device=device, dtype=p.dtype)
+        fake_prob[mask_token_id] = 1.0
+        probs_ext[remask_mask] = fake_prob.unsqueeze(0)
 
     return FrameDelta(
         transfer_index=transfer_index,
@@ -246,6 +242,7 @@ def wino_generate_step(
         intermediate=Intermediate(
             hidden_states=hidden_states if hidden_states is not None else tuple()
         ),
+        extra=dict(num_last_wide_in=num_last_wide_in),
     )
 
 
@@ -266,7 +263,6 @@ def wino_generate(
     # wino
     wide_in_thres: float = 0.6,
     narrow_out_thres: float = 0.9,
-    # other params
     output_hidden_states: bool = False,
     output_probs: bool = False,
 ) -> DecodeRecord:
@@ -298,11 +294,10 @@ def wino_generate(
     frame = initial_frame
     deltas = []
 
-    last_accept = torch.full(
-        (input_ids.size(0),), 30, device=model.device, dtype=torch.long
-    )
-
     for block_idx in range(num_blocks):
+        num_last_wide_in = torch.full(
+            (input_ids.size(0),), 30, device=model.device, dtype=torch.long
+        )
         block_mask = torch.zeros(
             (input_ids.size(0), gen_length),
             dtype=torch.bool,
@@ -327,7 +322,7 @@ def wino_generate(
                 mask_token_id=mask_token_id,
                 wide_in_thres=wide_in_thres,
                 narrow_out_thres=narrow_out_thres,
-                last_accept=last_accept,
+                num_last_wide_in=num_last_wide_in,
                 output_hidden_states=output_hidden_states,
                 output_probs=output_probs,
             )
@@ -335,15 +330,8 @@ def wino_generate(
             if delta is None:
                 break
 
-            # update last_accept based on Wide In count
-            last_accept.fill_(0)
-            for b in range(len(delta.transfer_index)):
-                idxs = delta.transfer_index[b]
-                if idxs.numel() > 0:
-                    # count tokens that were mask_id in current frame (Wide In)
-                    tokens_at_idxs = frame.generated_tokens[b, idxs]
-                    wide_in_count = (tokens_at_idxs == mask_token_id).sum().item()
-                    last_accept[b] = wide_in_count
+            # update num_last_wide_in based on Wide In count
+            num_last_wide_in = delta.extra.pop("num_last_wide_in")
 
             deltas.append(delta.to("cpu"))
             frame = frame.apply_delta(delta)
