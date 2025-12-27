@@ -107,7 +107,7 @@ def wino_generate_step(
         block_mask_curr.unsqueeze(-1),
         logits[:, prompt_length + block_start : prompt_length + block_end],
         logits[:, -block_length:],
-    )
+    ).to(torch.float64)
 
     hidden_states = (
         tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
@@ -126,7 +126,10 @@ def wino_generate_step(
     )
 
     # for masked positions, sample_tokens' confidence already matches x0; for unmasked, gather current tokens.
-    current_conf = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+    current_tokens = generated_active[:, block_start:block_end]
+    current_conf = torch.gather(p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(
+        -1
+    )
     confidence = torch.where(block_mask_curr, combined_conf, current_conf)
 
     # Unmasking (Wide In)
@@ -158,10 +161,11 @@ def wino_generate_step(
 
     # Remasking (Narrow Out)
     remask_mask = torch.zeros_like(unmask_mask)
-    active_num_last_wide_in = num_last_wide_in[can_generate]
-    num_last_wide_in[can_generate] = unmask_mask_block.sum(dim=1)
+    current_wide_in = unmask_mask_block.sum(dim=1)
+    num_last_wide_in[can_generate] = current_wide_in
+
     # only consider samples that have unmasked at least one token
-    can_remask = unmask_mask.sum(dim=1) > 1
+    can_remask = current_wide_in > 0
 
     # use shadow block probs for already-unmasked tokens
     shadow_conf = torch.where(~block_mask_curr, confidence, torch.inf)
@@ -173,16 +177,20 @@ def wino_generate_step(
         row_conf = shadow_conf[i]
         row_remask = row_conf < narrow_out_thres
 
-        target_k = int(active_num_last_wide_in[i].item()) - 1
-        if target_k > 0 and row_remask.sum() >= active_num_last_wide_in[i]:
-            # select bottom-k to remask, only when k is valid
-            _, idx = torch.topk(row_conf.view(-1), k=target_k, largest=False)
-            row_remask = (
-                torch.zeros_like(row_remask)
-                .view(-1)
-                .scatter_(0, idx, True)
-                .view_as(row_remask)
-            )
+        target_k = int(current_wide_in[i].item()) - 1
+
+        if row_remask.sum() > target_k:
+            if target_k <= 0:
+                row_remask[:] = False
+            else:
+                # select bottom-k to remask, only when k is valid
+                _, idx = torch.topk(row_conf.view(-1), k=target_k, largest=False)
+                row_remask = (
+                    torch.zeros_like(row_remask)
+                    .view(-1)
+                    .scatter_(0, idx, True)
+                    .view_as(row_remask)
+                )
 
         remask_mask[i, block_start:block_end] = row_remask
 
@@ -243,7 +251,7 @@ def wino_generate_step(
             hidden_states=hidden_states if hidden_states is not None else tuple()
         ),
         extra=dict(num_last_wide_in=num_last_wide_in),
-    )
+    ).to(model.dtype)
 
 
 @register.gen_strategy("wino")
