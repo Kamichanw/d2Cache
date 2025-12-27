@@ -6,6 +6,3 @@ sigma: 10.0
 # select all unselected tokens between two selected tokens
 # inflate_w controls the width of inflation, only used in parallel+semi-AR decoding.
 inflate_w: 0
-
-# block size for rollout selection
-rollout_block_size: 32

@@ -196,7 +196,7 @@ Seo Hyun Kim, Sunwoo Hong, Hojung Jung, Youngrok Park, Se-Young Yun
 <details>
 <summary><strong>Abstract</strong></summary>
 
-Masked diffusion models have demonstrated competitive results on various tasks including language generation. However, due to its iterative refinement process, the inference is often bottlenecked by slow and static sampling speed. To overcome this problem, we introduce `KL-Adaptive Stability Sampling' (KLASS), a fast yet effective sampling method that exploits token-level KL divergence to identify stable, high-confidence predictions. By unmasking multiple tokens in each iteration without any additional model training, our approach speeds up generation significantly while maintaining sample quality. On reasoning benchmarks, KLASS achieves up to 2.78\times wall-clock speedups while improving performance over standard greedy decoding, attaining state-of-the-art results among diffusion-based samplers. We further validate KLASS across diverse domains, including text, image, and molecular generation, showing its effectiveness as a broadly applicable sampler across different models.
+Masked diffusion models have demonstrated competitive results on various tasks including language generation. However, due to its iterative refinement process, the inference is often bottlenecked by slow and static sampling speed. To overcome this problem, we introduce `KL-Adaptive Stability Sampling' (KLASS), a fast yet effective sampling method that exploits token-level KL divergence to identify stable, high-confidence predictions. By unmasking multiple tokens in each iteration without any additional model training, our approach speeds up generation significantly while maintaining sample quality. On reasoning benchmarks, KLASS achieves up to 2.78x wall-clock speedups while improving performance over standard greedy decoding, attaining state-of-the-art results among diffusion-based samplers. We further validate KLASS across diverse domains, including text, image, and molecular generation, showing its effectiveness as a broadly applicable sampler across different models.
 
 </details>
 
@@ -224,3 +224,70 @@ accelerate launch \
     generation.kl_history_length=2 \
     model=llada-inst 
 ```
+
+
+## Accelerated Sampling from Masked Diffusion Models via Entropy Bounded Unmasking
+Heli Ben-Hamu, Itai Gat, Daniel Severo, Niklas Nolte, Brian Karrer
+
+<details>
+<summary><strong>Abstract</strong></summary>
+Recent masked diffusion models (MDMs) have shown competitive performance compared to autoregressive models (ARMs) for language modeling. While most literature has focused on performance enhancing sampling procedures, efficient sampling from MDMs has been scarcely explored. We make the observation that often a given sequence of partially masked tokens determines the values of multiple unknown tokens deterministically, meaning that a single prediction of a masked model holds additional information unused by standard sampling procedures. Based on this observation, we introduce EB-Sampler, a simple drop-in replacement for existing samplers, utilizing an Entropy Bounded unmasking procedure that dynamically unmasks multiple tokens in one function evaluation with predefined approximate error tolerance. We formulate the EB-Sampler as part of a broad family of adaptive samplers for which we provide an error analysis that motivates our algorithmic choices. EB-Sampler accelerates sampling from current state of the art MDMs by roughly 2-3x on standard coding and math reasoning benchmarks without loss in performance. We also validate the same procedure works well on smaller reasoning tasks including maze navigation and Sudoku, tasks ARMs often struggle with.
+</details>
+
+### Hyper-parameters
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `generation.gamma` | `float` | Threshold described in Eq.(2), influencing the number of steps where $\gamma=0$ will unmask one token each step and $\gamma=\infty$ will unmask all tokens at once. |
+
+### Example Usage
+
+```bash
+# Test EB-Sampler on GSM8K with LLaDA-7B-Instruct, run:
+accelerate launch \
+    --num_machines 1 \
+    --num_processes 4 \
+    eval.py \
+    dataset.name=gsm8k \
+    batch_size=1 \
+    seed=1234 \
+    generation=eb_sampler \
+    generation.block_length=64 \
+    generation.gamma=0.001 \
+    model=llada-inst 
+```
+
+## Wide-In, Narrow-Out: Revokable Decoding for Efficient and Effective DLLMs
+Feng Hong, Geng Yu, Yushi Ye, Haicheng Huang, Huangjie Zheng, Ya Zhang, Yanfeng Wang, Jiangchao Yao
+<details>
+<summary><strong>Abstract</strong></summary>
+Diffusion Large Language Models (DLLMs) have emerged as a compelling alternative to Autoregressive models, designed for fast parallel generation. However, existing DLLMs are plagued by a severe quality-speed trade-off, where faster parallel decoding leads to significant performance degradation. We attribute this to the irreversibility of standard decoding in DLLMs, which is easily polarized into the wrong decoding direction along with early error context accumulation. To resolve this, we introduce Wide-In, Narrow-Out (WINO), a training-free decoding algorithm that enables revokable decoding in DLLMs. WINO employs a parallel draft-and-verify mechanism, aggressively drafting multiple tokens while simultaneously using the model's bidirectional context to verify and re-mask suspicious ones for refinement. Verified in open-source DLLMs like LLaDA and MMaDA, WINO is shown to decisively improve the quality-speed trade-off. For instance, on the GSM8K math benchmark, it accelerates inference by 6x while improving accuracy by 2.58%; on Flickr30K captioning, it achieves a 10x speedup with higher performance. More comprehensive experiments are conducted to demonstrate the superiority and provide an in-depth understanding of WINO.
+</details>
+
+### Hyper-parameters
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `generation.wide_in_thres` | `float` | Threshold used in draft stage, which allows more possible tokens to be decoded at each step. |
+| `generation.narrow_out_thres` | `float` | Confidence threshold for verification. |
+
+### Example Usage
+
+```bash
+# Test WINO on GSM8K with LLaDA-7B-Instruct, run:
+accelerate launch \
+    --num_machines 1 \
+    --num_processes 4 \
+    eval.py \
+    dataset.name=gsm8k \
+    batch_size=1 \
+    seed=1234 \
+    generation=wino \
+    generation.block_length=128 \
+    generation.wide_in_thres=0.6 \
+    generation.narrow_out_thres=0.9 \
+    model=llada-inst 
+```
+
+> [!NOTE]
+> WINO could theoretically be used in conjunction with `PrefixCache` or `DualCache`, but this is not currently implemented.

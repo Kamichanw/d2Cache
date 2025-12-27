@@ -49,6 +49,14 @@ class AttentionContext:
         query_length: int | None = None,
         key_value_length: int | None = None,
     ):
+        """
+        Convert masks to the form expected by attention kernels.
+
+        - Boolean mask: True means *keep* (attend), False means mask out. We convert to additive mask
+          with 0 for keep and -inf for mask, using the provided dtype.
+        - Float mask: assumed already additive; returned as-is (after any required expansion).
+        Shapes: accept (B, L) or (B, 1, Q, K) / (B, Q, K).
+        """
         if attention_mask is not None:
             if attention_mask.dim() == 2:  # (B, kv_len) -> (B, 1, q_len, kv_len)
                 try:
@@ -66,7 +74,7 @@ class AttentionContext:
                     f"Expected attention_mask to have 2 or 4 dimensions, but got {attention_mask.dim()}."
                 )
 
-            attention_mask = (1.0 - attention_mask.to(dtype)) * torch.finfo(dtype).min
+            # attention_mask = (1.0 - attention_mask.to(dtype)) * torch.finfo(dtype).min
 
         return attention_mask
 

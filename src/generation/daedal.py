@@ -41,7 +41,6 @@ def daedal_generate(
     model,
     input_ids: torch.Tensor,
     alg: str = "maskgit_plus",
-    steps: int = 128,
     block_length: int = 32,
     initial_gen_length: int = 128,
     max_gen_length: int = 2048,
@@ -59,7 +58,6 @@ def daedal_generate(
     threshold: float = 0.9,
     factor: float | None = None,
     output_hidden_states: bool = False,
-    output_probs: bool = False,
 ) -> DecodeRecord:
     """
     DAEDAL generation for LLaDA, see https://arxiv.org/abs/2508.00819.
@@ -85,8 +83,6 @@ def daedal_generate(
         raise ValueError(
             "mask_token_id, pad_token_id, and eot_token_id must be provided either as arguments or environment variables."
         )
-
-    assert initial_gen_length % block_length == 0
 
     batch_size, prompt_length = input_ids.shape
     gen_lengths = torch.full(

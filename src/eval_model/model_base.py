@@ -3,7 +3,7 @@ import accelerate
 import torch
 import itertools
 
-from typing import cast
+from typing import Iterable, cast
 from datetime import timedelta
 from omegaconf import DictConfig
 from lm_eval.api.model import TemplateLM
@@ -60,8 +60,23 @@ class EvalModelBase(TemplateLM):
         self.device = self.accelerator.device
         self.extra_gen_kwargs = kwargs.get("extra_gen_kwargs", {})
 
-    def tok_encode(self, string: str, **kwargs):
-        return self.tokenizer(string, **kwargs).input_ids
+    def tok_encode(
+        self, string: str, add_special_tokens: bool | None = None, **kwargs
+    ) -> list[int]:
+        """
+        Tokenize a string using the model's tokenizer and return a list of token IDs.
+        NOTE: This method is expected to handle strings which already contain the BOS token (when add_special_tokens=None).
+        Otherwise, will use add_special_tokens if specified.
+        """
+        add_special_tokens = add_special_tokens or self.cfg.get("add_bos_token")
+        # set add_special_tokens=False if the string already starts with BOS token.
+        if add_special_tokens is None and has_bos_prefix(
+            string, self.tokenizer.decode(self.prefix_token_id)
+        ):
+            add_special_tokens = False
+        if add_special_tokens is not None:
+            kwargs["add_special_tokens"] = add_special_tokens
+        return self.tokenizer.encode(string, **kwargs)
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
         raise NotImplementedError
@@ -116,7 +131,7 @@ class EvalModelBase(TemplateLM):
                 context = [
                     (
                         self.tokenizer.bos_token + ctx
-                        if not ctx.startswith(self.tokenizer.bos_token)
+                        if not has_bos_prefix(ctx, self.tokenizer.bos_token)
                         else ctx
                     )
                     for ctx in context
@@ -163,6 +178,10 @@ class EvalModelBase(TemplateLM):
             except torch.cuda.OutOfMemoryError:
                 out.append("[out-of-memory]")
 
+            # if you got a watchdog timeout error, you can uncomment this line to avoid it.
+            # it will slow down the evaluation though.
+            # self.accelerator.wait_for_everyone()
+
         throughput = self.accelerator.gather_for_metrics(throughput)
         tps = self.accelerator.gather_for_metrics(tps)
         full_throughput = self.accelerator.gather_for_metrics(full_throughput)
@@ -199,3 +218,12 @@ class EvalModelBase(TemplateLM):
         )
         assert isinstance(chat_templated, str)
         return chat_templated
+
+
+def has_bos_prefix(sequence: str, bos_str: str | Iterable[str] | None = None):
+    if bos_str is None:
+        return False
+    elif isinstance(bos_str, str):
+        return sequence.startswith(bos_str)
+    else:
+        return any(sequence.startswith(x) for x in bos_str)
