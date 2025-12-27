@@ -6,11 +6,11 @@ accelerate launch \
     --num_processes 4 \
     eval.py \
     dataset.name=humaneval \
-    dataset.n_shot=0 \
     batch_size=1 \
     seed=1234 \
-    generation=wino_official \
-    generation.gen_length=256 \
-    generation.block_length=128 \
+    generation=vanilla \
+    generation.steps=512 \
+    generation.gen_length=512 \
+    generation.block_length=32 \
+    generation.threshold=0.9 \
     model=llada-inst 
-
