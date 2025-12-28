@@ -4,10 +4,10 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from src.eval_model.model_base import EvalModelBase
+from ..eval_mdlm import EvalMDLM
 
 
-class LLaDAEval(EvalModelBase):
+class LLaDAEval(EvalMDLM):
     def __init__(
         self,
         cfg: DictConfig,

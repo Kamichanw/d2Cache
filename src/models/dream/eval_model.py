@@ -8,10 +8,10 @@ from omegaconf import DictConfig
 from lm_eval.api.instance import Instance
 from tqdm import tqdm
 
-from src.eval_model.model_base import EvalModelBase
+from ..eval_mdlm import EvalMDLM
 
 
-class DreamEval(EvalModelBase):
+class DreamEval(EvalMDLM):
     def __init__(
         self,
         cfg: DictConfig,

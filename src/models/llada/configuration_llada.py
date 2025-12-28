@@ -1,36 +1,22 @@
 """
 LLaDA configuration
 """
+
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
 from enum import Enum
 from os import PathLike
 from typing import Union
-from dataclasses import asdict, dataclass, field
-from glob import glob
-from pathlib import Path
-from typing import (
-    Any,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    Type,
-    TypeVar,
-    Union,
-    cast,
-)
+from typing import Optional, Union
 
 
 __all__ = [
     "ActivationType",
-    "ActivationCheckpointingStrategy",
     "BlockType",
     "LayerNormType",
     "InitFnType",
-    "ModelConfig",
+    "LLaDAConfig",
 ]
 
 PathOrStr = Union[str, PathLike]
@@ -126,58 +112,11 @@ class InitFnType(StrEnum):
     This is what metaseq calls "full megatron init". It is the init used for Llama 2.
     """
 
-class ActivationCheckpointingStrategy(StrEnum):
-    whole_layer = "whole_layer"
-    """
-    Checkpoint every transformer layer.
-    """
-
-    one_in_two = "one_in_two"
-    """
-    Checkpoint one in two transformer layers.
-    """
-
-    one_in_three = "one_in_three"
-    """
-    Checkpoint one in three transformer layers.
-    """
-
-    one_in_four = "one_in_four"
-    """
-    Checkpoint one in four transformer layers.
-    """
-    
-    two_in_three = "two_in_three"
-    """
-    Checkpoint two out of every three transformer layers.
-    """
-
-    three_in_four = "three_in_four"
-    """
-    Checkpoint three out of four of every transformer layers.
-    """
-
-    four_in_five = "four_in_five"
-    """
-    Checkpoint four out of five of every transformer layers.
-    """
-
-    nine_in_ten = "nine_in_ten"
-    """
-    Checkpoint nine out of ten of every transformer layers.
-    """
-
-    fine_grained = "fine_grained"
-    """
-    Focus checkpointing on where it is cheap to recompute and saves most memory.
-    """
-
 
 class LLaDAConfig(PretrainedConfig):
     model_type = "llada"
     keys_to_ignore_at_inference = ["past_key_values"]  # TODO: confirm
 
-    
     # Note that the defaults for these attributes are equivalent to the base GPT2 model.
 
     d_model: int = 768
@@ -433,9 +372,7 @@ class LLaDAConfig(PretrainedConfig):
         all_kwargs = kwargs
         all_kwargs.update({"use_cache": use_cache})
         all_kwargs.update(
-            {
-                "architectures": all_kwargs.get("architectures", ["LLaDAModelLM"])
-            }
+            {"architectures": all_kwargs.get("architectures", ["LLaDAModelLM"])}
         )
         super().__init__(**all_kwargs)
 
@@ -454,6 +391,7 @@ class LLaDAConfig(PretrainedConfig):
     @property
     def num_key_value_heads(self):
         return self.num_attention_heads
+
 
 # Register the config class so that it is available for transformer pipelines, auto-loading etc.
 AutoConfig.register("llada", LLaDAConfig)

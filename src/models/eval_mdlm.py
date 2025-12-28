@@ -8,19 +8,17 @@ from datetime import timedelta
 from omegaconf import DictConfig
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.instance import Instance
-from transformers import AutoTokenizer
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from tqdm import tqdm
 
 from src.frame import Frame
-from src.generation import generate, decode_final_frame
-from src.utils import Timer, load_pretrained_model
+from src.utils import Timer, load_pretrained_model, load_tokenizer
 
 
-class EvalModelBase(TemplateLM):
+class EvalMDLM(TemplateLM):
     """
-    Mixin class for testing speed of a model.
+    Base class for evaluating masked denoising language models (MDLMs) using the LM Evaluation Harness.
     """
 
     def __init__(self, cfg: DictConfig, **kwargs):
@@ -40,8 +38,8 @@ class EvalModelBase(TemplateLM):
             .eval()
             .to(self.accelerator.device)
         )
-        self.tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast = (
-            AutoTokenizer.from_pretrained(cfg.model.path, trust_remote_code=True)
+        self.tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast = load_tokenizer(
+            cfg, trust_remote_code=True
         )
 
         # setup properties from LM
@@ -105,6 +103,8 @@ class EvalModelBase(TemplateLM):
             continuation: str
                 The generated continuation.
         """
+        from src.generation import generate, decode_final_frame
+
         out, throughput, tps = [], [], []
         full_throughput, full_tps = [], []
         latency = []

@@ -41,9 +41,16 @@ Codebase for Diffusion Language Models Research
 
 [25/12/06] 🚀 We are looking for help to reproduce our experimental results using A100 GPUs. Please contact us if you can assist with the benchmarking.
 
-# Supported Methods
-The corresponding usages can be found [here](./docs/kv_caching.md).
+# Supported Models & Methods
+## Models
+The following models are supported out-of-the-box:
+| Model | Paper | Original Code Repo |
+|:---|:---:|:---:|
+| LLaDA-8B (`llada-base`, `llada-inst`) | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
+| Dream-v0-7B (`dream-base`, `dream-inst`) | <a href="https://arxiv.org/abs/2508.15487"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.15487-red"></a> | <a href="https://github.com/DreamLM/Dream"><img alt="Static Badge" src="https://img.shields.io/github/stars/DreamLM/Dream?style=social&label=Stars"></a> |
+
 ## KV Caching
+The corresponding usages can be found [here](./docs/kv_caching.md).
 
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|

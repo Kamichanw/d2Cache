@@ -4,16 +4,14 @@ import logging
 import math
 import sys
 from abc import abstractmethod
-from functools import partial
 from typing import (
     Callable,
-    List,
+    Union,
     Optional,
     Tuple,
     cast,
 )
-from dataclasses import dataclass, fields
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
 
 import torch
 import torch.backends.cuda
@@ -24,7 +22,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils.generic import ModelOutput
 from transformers.models.auto import AutoModel
 
-from ..cache import dCache
+from ...cache import dCache
 from .configuration_llada import (
     LLaDAConfig,
     StrEnum,
@@ -32,10 +30,8 @@ from .configuration_llada import (
     ActivationType,
     BlockType,
     LayerNormType,
-    ActivationCheckpointingStrategy,
 )
 
-from ..utils import Timer
 
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
@@ -59,6 +55,8 @@ __all__ = [
     "LLaDAOutput",
     "LLaDAOutputWithPast",
     "LLaDAGenerateOutput",
+    "LLaDAPreTrainedModel",
+    "LLaDAModelLM",
 ]
 
 
@@ -70,105 +68,6 @@ class ModuleType(StrEnum):
     out_module = "out"
     emb = "emb"
     final_out = "final_out"
-
-
-def init_weights(
-    config: LLaDAConfig,
-    module: Union[nn.Linear, nn.Embedding],
-    d: Optional[int] = None,
-    layer_id: Optional[int] = None,
-    std_factor: float = 1.0,
-    type_of_module: Optional[ModuleType] = None,
-) -> None:
-    """
-    Initialize weights of a linear or embedding module.
-
-    :param config: The model config.
-    :param module: The linear or embedding submodule to initialize.
-    :param d: The effective input dimensionality of the weights. This could be smaller than the actual dimensions
-        for fused layers.
-    :param layer_id: When set, the standard deviation for the "mitchell" method will be adjusted by
-        ``1 / sqrt(2 * (layer_id + 1))``.
-    """
-    d = d if d is not None else config.d_model
-    if config.init_fn == InitFnType.normal:
-        std = config.init_std * std_factor
-        if config.init_cutoff_factor is not None:
-            cutoff_value = config.init_cutoff_factor * std
-            nn.init.trunc_normal_(
-                module.weight, mean=0.0, std=std, a=-cutoff_value, b=cutoff_value
-            )
-        else:
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-    elif config.init_fn == InitFnType.mitchell:
-        std = std_factor / math.sqrt(d)  # type: ignore
-        if layer_id is not None:
-            std = std / math.sqrt(2 * (layer_id + 1))
-        nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
-    elif config.init_fn == InitFnType.kaiming_normal:
-        nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-    elif config.init_fn == InitFnType.fan_in:
-        std = std_factor / math.sqrt(d)  # type: ignore
-        nn.init.normal_(module.weight, mean=0.0, std=std)
-    elif config.init_fn == InitFnType.full_megatron:
-        if type_of_module is None:
-            raise RuntimeError(
-                f"When using the {InitFnType.full_megatron} init, every module must have a type."
-            )
-
-        cutoff_factor = config.init_cutoff_factor
-        if cutoff_factor is None:
-            cutoff_factor = 3
-
-        if type_of_module == ModuleType.in_module:
-            # for att_proj (same as QKV), ff_proj
-            std = config.init_std
-        elif type_of_module == ModuleType.out_module:
-            # for attn_out, ff_out
-            std = config.init_std / math.sqrt(2.0 * config.n_layers)
-        elif type_of_module == ModuleType.emb:
-            # positional embeddings (wpe)
-            # token embeddings (wte)
-            std = config.init_std
-        elif type_of_module == ModuleType.final_out:
-            # final output (ff_out)
-            std = config.d_model**-0.5
-        else:
-            raise RuntimeError(f"Unknown module type '{type_of_module}'")
-        nn.init.trunc_normal_(
-            module.weight,
-            mean=0.0,
-            std=std,
-            a=-cutoff_factor * std,
-            b=cutoff_factor * std,
-        )
-    else:
-        raise NotImplementedError(config.init_fn)
-
-    if isinstance(module, nn.Linear):
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-
-        if config.init_fn == InitFnType.normal and getattr(
-            module, "_is_residual", False
-        ):
-            with torch.no_grad():
-                module.weight.div_(math.sqrt(2 * config.n_layers))
-
-
-def activation_checkpoint_function(cfg: LLaDAConfig):
-    preserve_rng_state = (
-        (cfg.attention_dropout == 0.0)
-        and (cfg.embedding_dropout == 0.0)
-        and (cfg.residual_dropout == 0.0)
-    )
-    from torch.utils.checkpoint import checkpoint
-
-    return partial(
-        checkpoint,
-        preserve_rng_state=preserve_rng_state,
-        use_reentrant=False,
-    )
 
 
 class BufferCache(dict, MutableMapping[str, torch.Tensor]):  # type: ignore
@@ -213,16 +112,12 @@ class LayerNormBase(nn.Module):
         if elementwise_affine or (
             elementwise_affine is None and self.config.layer_norm_with_affine
         ):
-            self.weight = nn.Parameter(
-                torch.ones(self.normalized_shape, device=config.init_device)
-            )
+            self.weight = nn.Parameter(torch.ones(self.normalized_shape))
             use_bias = self.config.bias_for_layer_norm
             if use_bias is None:
                 use_bias = self.config.include_bias
             if use_bias:
-                self.bias = nn.Parameter(
-                    torch.zeros(self.normalized_shape, device=config.init_device)
-                )
+                self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
             else:
                 self.register_parameter("bias", None)
         else:
@@ -266,12 +161,6 @@ class LayerNormBase(nn.Module):
             )
         else:
             return tensor
-
-    def reset_parameters(self):
-        if self.weight is not None:
-            torch.nn.init.ones_(self.weight)  # type: ignore
-        if self.bias is not None:
-            torch.nn.init.zeros_(self.bias)  # type: ignore
 
 
 class LayerNorm(LayerNormBase):
@@ -580,8 +469,6 @@ class LLaDABlock(nn.Module):
         self.__cache = cache
         assert config.d_model % config.n_heads == 0
 
-        self._activation_checkpoint_fn = None
-
         # Dropout.
         self.dropout = Dropout(config.residual_dropout)
 
@@ -607,17 +494,19 @@ class LLaDABlock(nn.Module):
             config.d_model,
             config.d_model,
             bias=config.include_bias,
-            device=config.init_device,
         )
+        setattr(self.attn_out, "layer_id", layer_id)
+        setattr(self.attn_out, "type_of_module", ModuleType.out_module)
 
         # Feed-forward output projection.
         self.ff_out = nn.Linear(
             int(self.act.output_multiplier * self.hidden_size),
             config.d_model,
             bias=config.include_bias,
-            device=config.init_device,
         )
-        self.ff_out._is_residual = True  # type: ignore
+        setattr(self.ff_out, "_is_residual", True)
+        setattr(self.ff_out, "layer_id", layer_id)
+        setattr(self.ff_out, "type_of_module", ModuleType.out_module)
 
         # Rotary embeddings.
         if self.config.rope:
@@ -628,34 +517,6 @@ class LLaDABlock(nn.Module):
             from flash_attn import flash_attn_func  # type: ignore
 
             self.flash_attn_func = flash_attn_func
-
-    def reset_parameters(self):
-        if self.k_norm is not None:
-            self.k_norm.reset_parameters()
-        if self.q_norm is not None:
-            self.q_norm.reset_parameters()
-        init_weights(
-            self.config,
-            self.attn_out,
-            d=self.config.d_model,
-            layer_id=self.layer_id,
-            type_of_module=ModuleType.out_module,
-        )
-        init_weights(
-            self.config,
-            self.ff_out,
-            d=self.ff_out.in_features,
-            layer_id=self.layer_id,
-            type_of_module=ModuleType.out_module,
-        )
-
-    def set_activation_checkpointing(
-        self, strategy: Optional[ActivationCheckpointingStrategy]
-    ):
-        if strategy == ActivationCheckpointingStrategy.fine_grained:
-            self._activation_checkpoint_fn = activation_checkpoint_function(self.config)
-        else:
-            self._activation_checkpoint_fn = None
 
     def _scaled_dot_product_attention(
         self,
@@ -796,48 +657,34 @@ class LLaDALlamaBlock(LLaDABlock):
             config.d_model,
             q_proj_out_dim,
             bias=config.include_bias | config.include_qkv_bias,
-            device=config.init_device,
         )
         self.k_proj = nn.Linear(
             config.d_model,
             k_proj_out_dim,
             bias=config.include_bias | config.include_qkv_bias,
-            device=config.init_device,
         )
         self.v_proj = nn.Linear(
             config.d_model,
             v_proj_out_dim,
             bias=config.include_bias | config.include_qkv_bias,
-            device=config.init_device,
         )
 
-        # Feed-forward input projection.
         self.ff_proj = nn.Linear(
             config.d_model,
             self.hidden_size,
             bias=config.include_bias,
-            device=config.init_device,
         )
         # new add
         self.up_proj = nn.Linear(
             config.d_model,
             self.hidden_size,
             bias=config.include_bias,
-            device=config.init_device,
         )
 
-    def reset_parameters(self):
-        super().reset_parameters()
-        self.attn_norm.reset_parameters()
-        self.ff_norm.reset_parameters()
-        # NOTE: the standard deviation for these weights does not depend on the layer.
-        init_weights(self.config, self.q_proj, d=self.config.d_model, layer_id=None)
-        init_weights(self.config, self.k_proj, d=self.config.d_model, layer_id=None)
-        init_weights(self.config, self.v_proj, d=self.config.d_model, layer_id=None)
-        init_weights(self.config, self.ff_proj, d=self.config.d_model, layer_id=None)
-        init_weights(
-            self.config, self.up_proj, d=self.config.d_model, layer_id=None
-        )  # new add
+        # Add metadata for init
+        for proj in [self.q_proj, self.k_proj, self.v_proj, self.ff_proj, self.up_proj]:
+            setattr(proj, "type_of_module", ModuleType.in_module)
+            setattr(proj, "layer_id", layer_id)
 
     def forward(
         self,
@@ -893,7 +740,7 @@ class LLaDALlamaBlock(LLaDABlock):
                 ctx.o, ctx.attn_weight = torch.empty_like(ctx.q), None
 
         q, k, v, o = ctx.q, ctx.k, ctx.v, ctx.o  # keep them for visualization
-        x = ctx.residual  + self.dropout(ctx.o)
+        x = ctx.residual + self.dropout(ctx.o)
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
@@ -966,9 +813,101 @@ class LLaDAGenerateOutput(ModelOutput):
     """
 
 
-class LLaDAModel(nn.Module):
-    def __init__(self, config: LLaDAConfig, init_params: bool = True):
-        super().__init__()
+class LLaDAPreTrainedModel(PreTrainedModel):
+    config_class = LLaDAConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _supports_sdpa = True
+    _no_split_modules = ["LLaDABlock", "LLaDALlamaBlock"]
+
+    def _init_weights(self, module):
+        """
+        Initialize the weights according to the HF best practices and the original model's scheme.
+        """
+        config = self.config
+
+        if isinstance(module, LayerNormBase):
+            if module.weight is not None:
+                nn.init.ones_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+            return
+
+        if not isinstance(module, (nn.Linear, nn.Embedding)):
+            return
+
+        # Extract metadata attached to the module
+        layer_id = getattr(module, "layer_id", None)
+        type_of_module = getattr(module, "type_of_module", None)
+
+        d = config.d_model
+        if isinstance(module, nn.Linear):
+            d = module.in_features
+
+        std_factor = 1.0
+        if isinstance(module, nn.Embedding) and type_of_module == ModuleType.emb:
+            if self.config.scale_logits:
+                std_factor = 0.5 * math.sqrt(self.config.d_model)
+
+        if config.init_fn == InitFnType.normal:
+            std = config.init_std * std_factor
+            if config.init_cutoff_factor is not None:
+                cutoff = config.init_cutoff_factor * std
+                nn.init.trunc_normal_(
+                    module.weight, mean=0.0, std=std, a=-cutoff, b=cutoff
+                )
+            else:
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+        elif config.init_fn == InitFnType.mitchell:
+            std = std_factor / math.sqrt(d)
+            if layer_id is not None:
+                std /= math.sqrt(2 * (layer_id + 1))
+            nn.init.trunc_normal_(
+                module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std
+            )
+        elif config.init_fn == InitFnType.kaiming_normal:
+            nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+        elif config.init_fn == InitFnType.fan_in:
+            std = std_factor / math.sqrt(d)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+        elif config.init_fn == InitFnType.full_megatron:
+            cutoff_factor = config.init_cutoff_factor or 3
+            if type_of_module == ModuleType.in_module:
+                std = config.init_std
+            elif type_of_module == ModuleType.out_module:
+                std = config.init_std / math.sqrt(2.0 * config.n_layers)
+            elif type_of_module == ModuleType.emb:
+                std = config.init_std
+            elif type_of_module == ModuleType.final_out:
+                std = config.d_model**-0.5
+            else:
+                raise RuntimeError(
+                    f"Unknown module type '{type_of_module}' for megatron init"
+                )
+            nn.init.trunc_normal_(
+                module.weight,
+                mean=0.0,
+                std=std,
+                a=-cutoff_factor * std,
+                b=cutoff_factor * std,
+            )
+        else:
+            raise NotImplementedError(config.init_fn)
+
+        if isinstance(module, nn.Linear):
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+            if config.init_fn == InitFnType.normal and getattr(
+                module, "_is_residual", False
+            ):
+                with torch.no_grad():
+                    module.weight.div_(math.sqrt(2 * config.n_layers))
+
+
+class LLaDAModel(LLaDAPreTrainedModel):
+
+    def __init__(self, config: LLaDAConfig):
+        super().__init__(config)
         self.config = config
         self.__cache = BufferCache()
 
@@ -977,46 +916,35 @@ class LLaDAModel(nn.Module):
             and self.config.embedding_size != self.config.vocab_size
         ):
             if self.config.embedding_size < self.config.vocab_size:
-                raise Exception(
+                raise ValueError(
                     "embedding size should be at least as big as vocab size"
                 )
             elif self.config.embedding_size % 128 != 0:
-                import warnings
-
-                warnings.warn(
-                    "Embedding size is not a multiple of 128! This could hurt throughput performance.",
-                    UserWarning,
+                log.warning(
+                    "Embedding size is not a multiple of 128! This could hurt performance."
                 )
-
-        self.activation_checkpointing_strategy: Optional[
-            ActivationCheckpointingStrategy
-        ] = None
-        self._activation_checkpoint_fn: Callable = activation_checkpoint_function(
-            self.config
-        )
 
         if not (
             0 < self.config.block_group_size <= self.config.n_layers
             and self.config.n_layers % self.config.block_group_size == 0
         ):
-            raise Exception("n layers must be divisible by block group size")
+            raise ValueError("n_layers must be divisible by block_group_size")
 
+        self.gradient_checkpointing = False
         torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(
-            False
-        )  # this is super slow so make sure torch won't use it
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
 
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(
                     config.embedding_size or config.vocab_size,
                     config.d_model,
-                    device=config.init_device,
                 ),
                 emb_drop=Dropout(config.embedding_dropout),
                 ln_f=LayerNorm.build(config),
             )
         )
+        setattr(self.transformer.wte, "type_of_module", ModuleType.emb)
 
         blocks = [
             LLaDABlock.build(i, config, self.__cache) for i in range(config.n_layers)
@@ -1025,73 +953,21 @@ class LLaDAModel(nn.Module):
         self.transformer.update({"blocks": nn.ModuleList(blocks)})
 
         if not (self.config.alibi or self.config.rope):
-            self.transformer.update(
-                {
-                    "wpe": nn.Embedding(
-                        config.max_sequence_length,
-                        config.d_model,
-                        device=config.init_device,
-                    )
-                }
+            wpe = nn.Embedding(
+                config.max_sequence_length,
+                config.d_model,
             )
+            setattr(wpe, "type_of_module", ModuleType.emb)
+            self.transformer.update({"wpe": wpe})
+
         if not config.weight_tying:
-            self.transformer.update(
-                {
-                    "ff_out": nn.Linear(
-                        config.d_model,
-                        config.embedding_size or config.vocab_size,
-                        bias=config.include_bias,
-                        device=config.init_device,
-                    )
-                }
+            ff_out = nn.Linear(
+                config.d_model,
+                config.embedding_size or config.vocab_size,
+                bias=config.include_bias,
             )
-        # When `init_device="meta"` FSDP will call `reset_parameters()` to initialize weights.
-        if init_params and self.config.init_device != "meta":
-            self.reset_parameters()
-        self.__num_fwd_flops: Optional[int] = None
-
-    def set_activation_checkpointing(
-        self, strategy: Optional[ActivationCheckpointingStrategy]
-    ):
-        self.activation_checkpointing_strategy = strategy
-        for block in self.transformer.blocks:  # type: ignore
-            block.set_activation_checkpointing(strategy)
-
-    @property
-    def device(self) -> torch.device:
-        device: torch.device = self.transformer.wte.weight.device  # type: ignore
-        if device.type == "meta":
-            return _non_meta_init_device(self.config)
-        else:
-            return device
-
-    def reset_parameters(self):
-        log.info("Initializing model parameters...")
-        # Top-level embeddings / linear layers.
-        init_weights(
-            self.config,
-            self.transformer.wte,  # type: ignore
-            std_factor=(
-                (0.5 * math.sqrt(self.config.d_model))
-                if self.config.scale_logits
-                else 1.0
-            ),
-            type_of_module=ModuleType.emb,
-        )
-        if hasattr(self.transformer, "wpe"):
-            init_weights(self.config, self.transformer.wpe, type_of_module=ModuleType.emb)  # type: ignore
-
-        # Top-level layer norm.
-        self.transformer.ln_f.reset_parameters()  # type: ignore
-
-        # Output weights.
-        if hasattr(self.transformer, "ff_out"):
-            init_weights(self.config, self.transformer.ff_out, type_of_module=ModuleType.final_out)  # type: ignore
-
-        # Let the blocks handle themselves.
-        assert self.config.block_group_size == 1
-        for block in self.transformer.blocks:  # type: ignore
-            block.reset_parameters()
+            setattr(ff_out, "type_of_module", ModuleType.final_out)
+            self.transformer.update({"ff_out": ff_out})
 
     def forward(
         self,
@@ -1106,7 +982,7 @@ class LLaDAModel(nn.Module):
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
-        :param input_embeddings: A tensor of shape `(batch_size, seq_len, d_model)` with input
+        :param input_embeds: A tensor of shape `(batch_size, seq_len, d_model)` with input
             embeddings. When provided, it is treated as the output of the input embedding layer.
         :param attention_mask: A tensor of shape `(batch_size, seq_len)` that indicates
             which input IDs are masked. A `1` value in the mask means that
@@ -1128,8 +1004,6 @@ class LLaDAModel(nn.Module):
         ), "Alibi length extrapolation is not supported for MDM."
         assert self.config.rope, "Rope must be used in Llama-Encoder for MDM."
         assert self.config.block_group_size == 1
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("You must provide input_ids or inputs_embeds.")
 
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else False
@@ -1166,7 +1040,7 @@ class LLaDAModel(nn.Module):
                 position_ids = attention_mask.cumsum(dim=-1) - 1
                 position_ids.masked_fill_(attention_mask == 0, 0)
 
-        if not (self.config.alibi or self.config.rope):
+        if hasattr(self.transformer, "wpe"):
             pos_emb = self.transformer.wpe(position_ids)  # type: ignore
             x = pos_emb + x
 
@@ -1180,17 +1054,25 @@ class LLaDAModel(nn.Module):
         with past_key_values.model_forward(x) as ctx:
             x = ctx.x
             # Apply blocks one-by-one.
-            for block_idx, block in enumerate(self.transformer.blocks):  # type: ignore
+            for block in self.transformer.blocks:  # type: ignore
                 if output_hidden_states:
-                    # add hidden states
                     all_hidden_states.append(x)
-                # shape: (batch_size, seq_len, d_model)
-                x = block(
-                    x,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                )
+
+                if self.gradient_checkpointing and self.training:
+                    x = self._gradient_checkpointing_func(
+                        block.__call__,
+                        x,
+                        attention_mask,
+                        position_ids,
+                        None,  # past_key_values must be None for checkpointing
+                    )
+                else:
+                    x = block(
+                        x,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                    )
 
             # Apply final layer norm.
             # shape: (batch_size, seq_len, d_model)
@@ -1212,28 +1094,39 @@ class LLaDAModel(nn.Module):
         return LLaDAOutput(logits=ctx.logits, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
 
 
-class LLaDAModelLM(PreTrainedModel):
+class LLaDAModelLM(LLaDAPreTrainedModel):
     """
-    Extremely barebones HF model wrapper.
+    LLaDA Model with a language modeling head.
     """
 
-    config_class = LLaDAConfig
-    base_model_prefix = "model"
-    _supports_sdpa = True
-    _no_split_modules = ["LLaDABlock", "LLaDALlamaBlock"]
-
-    def __init__(
-        self,
-        config: LLaDAConfig,
-        model: Optional[LLaDAModel] = None,
-        init_params: bool = False,
-    ):
+    def __init__(self, config: LLaDAConfig):
         super().__init__(config)
+        self.model = LLaDAModel(config)
 
-        if not model:
-            self.model = LLaDAModel(config, init_params=init_params)
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.transformer.wte # type: ignore
+
+    def set_input_embeddings(self, value: nn.Module):
+        self.model.transformer.wte = value
+
+    def get_output_embeddings(self) -> nn.Module:
+        if self.config.weight_tying:
+            return self.model.transformer.wte # type: ignore
         else:
-            self.model = model
+            return self.model.transformer.ff_out # type: ignore
+
+    def set_output_embeddings(self, new_embeddings: nn.Module):
+        if self.config.weight_tying:
+            self.model.transformer.wte = new_embeddings
+        else:
+            self.model.transformer.ff_out = new_embeddings
+
+    def tie_weights(self):
+        if self.config.weight_tying:
+            self.model.transformer.ff_out = self.get_output_embeddings()
 
     def forward(
         self,
@@ -1248,22 +1141,17 @@ class LLaDAModelLM(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, LLaDAOutputWithPast]:
-        if use_cache is None:
-            use_cache = self.config.use_cache
-        if use_cache and past_key_values is None:
-            raise ValueError(
-                "use_cache is True but past_key_values is None. "
-                "You must pass a specific dCache to use cache."
-            )
-
-        if output_attentions:
-            raise ValueError("output_attentions is not yet supported in LLaDA")
-
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        if use_cache and past_key_values is None:
+            past_key_values = dCache(self.config)
+
+        if output_attentions:
+            raise ValueError("output_attentions is not yet supported in LLaDA")
+
         outputs = self.model.forward(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1279,18 +1167,18 @@ class LLaDAModelLM(PreTrainedModel):
 
         loss = None
         if labels is not None:
-            import warnings
-
-            warnings.warn(
-                "Note that for LLaDA, you cannot calculate the loss here.", UserWarning
+            log.warning(
+                "Loss calculation within the LLaDA model is not standard. External calculation is recommended."
             )
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return LLaDAOutputWithPast(
+            loss=loss,
             logits=logits,
-            past_key_values=past_key_values,
+            past_key_values=past_key_values if use_cache else None,
             hidden_states=hidden_states,
         )
 
@@ -1301,32 +1189,21 @@ class LLaDAModelLM(PreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
-        past_key_values: Optional[List[Tuple]] = None,
+        past_key_values: Optional[dCache] = None,
         **kwargs,
     ):
-        raise NotImplementedError
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
 
-    def get_input_embeddings(self) -> torch.nn.Module:
-        return self.model.transformer.wte  # type: ignore
+        position_ids = kwargs.get("position_ids", None)
 
-    def set_input_embeddings(self, value: torch.nn.Module):
-        self.model.transformer.wte = value
-
-    def get_output_embeddings(self) -> torch.nn.Module:
-        if self.config.weight_tying:
-            return self.model.transformer.wte  # type: ignore
-        else:
-            return self.model.transformer.ff_out  # type: ignore
-
-    def set_output_embeddings(self, value: torch.nn.Module):
-        if self.config.weight_tying:
-            self.model.transformer.wte = value
-        else:
-            self.model.transformer.ff_out = value
-
-    def tie_weights(self):
-        if self.config.weight_tying:
-            self.model.transformer.ff_out = self.model.transformer.wte
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "position_ids": position_ids,
+            "attention_mask": kwargs.get("attention_mask"),
+        }
 
 
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
