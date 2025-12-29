@@ -8,7 +8,7 @@ import tempfile
 import zipfile
 import omegaconf
 import warnings
-import importlib_metadata
+from importlib.metadata import version
 
 from pathlib import Path
 from typing import Callable
@@ -33,7 +33,7 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
     `antlr4-python3-runtime` version 4.11, which caused a conflict. This context manager solves the conflict by dynamically
     loading the required version at runtime without altering the base environment.
     """
-    current_version = importlib_metadata.version("antlr4-python3-runtime")
+    current_version = version("antlr4-python3-runtime")
     logger.info(
         f"Detected antlr4-python3-runtime version {current_version}. Temporarily switching to {target_version}..."
     )
