@@ -13,8 +13,7 @@ from loguru import logger
 from lm_eval.evaluator import simple_evaluate
 from lm_eval.tasks import TaskManager
 
-from src.eval_model import load_eval_model
-from src.utils import pre_initialize, Timer, sympy_antlr_patcher
+from src.utils import pre_initialize, Timer, sympy_antlr_patcher, load_eval_model
 
 
 def serializer(o):

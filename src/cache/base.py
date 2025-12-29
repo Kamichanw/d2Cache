@@ -74,7 +74,7 @@ class AttentionContext:
                     f"Expected attention_mask to have 2 or 4 dimensions, but got {attention_mask.dim()}."
                 )
 
-            # attention_mask = (1.0 - attention_mask.to(dtype)) * torch.finfo(dtype).min
+            attention_mask = (1.0 - attention_mask.to(dtype)) * torch.finfo(dtype).min
 
         return attention_mask
 

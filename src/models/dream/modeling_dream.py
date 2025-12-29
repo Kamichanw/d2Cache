@@ -38,7 +38,6 @@ from transformers.utils import logging
 from transformers.configuration_utils import PretrainedConfig
 
 from src.cache import dCache
-from src.utils import Timer
 from .configuration_dream import DreamConfig
 from .generation_utils import DreamGenerationMixin, DreamGenerationConfig
 
@@ -723,7 +722,7 @@ class DreamBaseModel(DreamPreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[dCache] = None,
@@ -765,15 +764,15 @@ class DreamBaseModel(DreamPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
+        assert inputs_embeds is not None  # for mypy type checking
         if position_ids is None:
             position_ids = (
                 torch.arange(
-                    input_ids.shape[1],
-                    device=input_ids.device,
+                    inputs_embeds.shape[1],
+                    device=inputs_embeds.device,
                 )
                 .unsqueeze(0)
-                .expand(input_ids.shape[0], -1)
+                .expand(inputs_embeds.shape[0], -1)
             )
 
         cm = past_key_values.model_forward(inputs_embeds)
@@ -882,7 +881,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[dCache] = None,

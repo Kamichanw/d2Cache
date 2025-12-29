@@ -3,13 +3,13 @@ import torch
 import torch.distributions as dists
 
 from src.frame import PLACEHOLDER_STEP, Frame
-from src.llada import LLaDAModelLM
-from src.dream import DreamModel
-from src.dream.generation_utils import top_k_logits, top_p_logits
+from src.models.dream.generation_utils import top_k_logits, top_p_logits
 
 
 def prepare_logits_for_generation(model, logits: torch.Tensor):
     """Prepare logits for unmasking."""
+    from src.models import LLaDAModelLM, DreamModel
+
     if isinstance(model, LLaDAModelLM):
         ...
     elif isinstance(model, DreamModel):
