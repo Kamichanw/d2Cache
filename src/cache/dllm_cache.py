@@ -171,9 +171,9 @@ class dLLMCache(dCache):
             self.attn_cache.append(ctx.o)
         else:
             if ctx.o.numel() > 0:
-                self.attn_cache[layer_idx][self.active_seq_mask].scatter_(
-                    1, refresh_index.unsqueeze(-1).expand(-1, -1, C), ctx.o
-                )
+                self.attn_cache[layer_idx][
+                    self.active_seq_mask.nonzero(), refresh_index
+                ] = ctx.o
 
         ctx.o = self.attn_cache[layer_idx][self.active_seq_mask]
 
@@ -191,9 +191,9 @@ class dLLMCache(dCache):
         if len(self.ffn_cache) <= layer_idx:
             self.ffn_cache.append(ctx.ffn_out)
         else:
-            self.ffn_cache[layer_idx][self.active_seq_mask].scatter_(
-                1, self._refresh_index.unsqueeze(-1).expand(-1, -1, C), ctx.ffn_out
-            )
+            self.ffn_cache[layer_idx][
+                self.active_seq_mask.nonzero(), self._refresh_index
+            ] = ctx.ffn_out
         ctx.ffn_out = self.ffn_cache[layer_idx][self.active_seq_mask]
 
     def on_step_start(self, block_mask: torch.Tensor, frame: Frame):
