@@ -7,7 +7,7 @@ rouge
 pydantic
 hydra-core
 accelerate==1.8.1
-lm-eval==0.4.9
+git+https://github.com/EleutherAI/lm-evaluation-harness.git
 loguru
 python-dotenv
 math_verify

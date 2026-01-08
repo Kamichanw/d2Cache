@@ -77,7 +77,9 @@ class dLLMCache(dCache):
             num_replace = int(x_response.size(1) * self.rou)
             cos_sim = F.cosine_similarity(
                 v_response,
-                self.value_cache[layer_idx][:, self._prompt_length :],
+                self.value_cache[layer_idx][
+                    self.active_seq_mask, self._prompt_length :
+                ],
                 dim=-1,
             )
             refresh_index_response = torch.topk(
@@ -99,12 +101,12 @@ class dLLMCache(dCache):
             q_position_ids = position_ids
         else:
             if refresh_prompt:
-                self.key_cache[layer_idx][:, : self._prompt_length] = k[
-                    :, : self._prompt_length
-                ]
-                self.value_cache[layer_idx][:, : self._prompt_length] = v[
-                    :, : self._prompt_length
-                ]
+                self.key_cache[layer_idx][
+                    self.active_seq_mask, : self._prompt_length
+                ] = k[:, : self._prompt_length]
+                self.value_cache[layer_idx][
+                    self.active_seq_mask, : self._prompt_length
+                ] = v[:, : self._prompt_length]
                 prompt_offset = self._prompt_length
             else:
                 prompt_offset = 0
@@ -120,16 +122,14 @@ class dLLMCache(dCache):
                         torch.arange(x_response.size(1)).unsqueeze(0).expand(B, -1)
                     )
 
-                refresh_index_response = refresh_index_response + self._prompt_length  # type: ignore
-
-                row_indices = torch.arange(B).unsqueeze(-1).expand_as(refresh_index_response)  # type: ignore
-                self.key_cache[layer_idx][row_indices, refresh_index_response] = k[
-                    :, prompt_offset:
-                ]
+                refresh_index_response: torch.Tensor = refresh_index_response + self._prompt_length  # type: ignore
+                self.key_cache[layer_idx][
+                    self.active_seq_mask.nonzero(), refresh_index_response
+                ] = k[:, prompt_offset:]
                 # note that for value states, we recompute all even we are using adaptive refreshing
-                self.value_cache[layer_idx][:, self._prompt_length :] = v[
-                    :, prompt_offset:
-                ]
+                self.value_cache[layer_idx][
+                    self.active_seq_mask, self._prompt_length :
+                ] = v[:, prompt_offset:]
 
                 if not refresh_response:
                     # we've concatenated index before if refresh_response is true
@@ -137,6 +137,9 @@ class dLLMCache(dCache):
 
                 if q_position_ids is not None:
                     assert position_ids is not None
+                    row_indices = (
+                        torch.arange(B).unsqueeze(-1).expand_as(refresh_index_response)
+                    )
                     q_position_ids = torch.cat(
                         [
                             q_position_ids,
@@ -148,8 +151,8 @@ class dLLMCache(dCache):
         self._refresh_index = refresh_index
         ctx = AttentionContext(
             q=q,
-            k=self.key_cache[layer_idx],
-            v=self.value_cache[layer_idx],
+            k=self.key_cache[layer_idx][self.active_seq_mask],
+            v=self.value_cache[layer_idx][self.active_seq_mask],
             residual=residual,
             attention_mask=AttentionContext.convert_attention_mask(
                 attention_mask,
@@ -168,11 +171,11 @@ class dLLMCache(dCache):
             self.attn_cache.append(ctx.o)
         else:
             if ctx.o.numel() > 0:
-                self.attn_cache[layer_idx].scatter_(
-                    1, refresh_index.unsqueeze(-1).expand(-1, -1, C), ctx.o
-                )
+                self.attn_cache[layer_idx][
+                    self.active_seq_mask.nonzero(), refresh_index
+                ] = ctx.o
 
-        ctx.o = self.attn_cache[layer_idx]
+        ctx.o = self.attn_cache[layer_idx][self.active_seq_mask]
 
     @contextmanager
     def ffn(self, layer_idx: int, x: torch.Tensor):
@@ -188,26 +191,30 @@ class dLLMCache(dCache):
         if len(self.ffn_cache) <= layer_idx:
             self.ffn_cache.append(ctx.ffn_out)
         else:
-            self.ffn_cache[layer_idx].scatter_(
-                1, self._refresh_index.unsqueeze(-1).expand(-1, -1, C), ctx.ffn_out
-            )
-        ctx.ffn_out = self.ffn_cache[layer_idx]
+            self.ffn_cache[layer_idx][
+                self.active_seq_mask.nonzero(), self._refresh_index
+            ] = ctx.ffn_out
+        ctx.ffn_out = self.ffn_cache[layer_idx][self.active_seq_mask]
 
     def on_step_start(self, block_mask: torch.Tensor, frame: Frame):
         current_steps = frame.steps.max(-1, keepdim=True).values
-        can_generate = torch.sum(
-            frame.generated_tokens == self.mask_token_id, dim=-1, keepdim=True
-        ).bool()
         refresh_prompt = (current_steps + 1) % self.kp == 0
         refresh_response = (current_steps + 1) % self.kr == 0
-        self._prompt_length = frame.prompts.size(-1)
+        B, self._prompt_length = frame.prompts.shape
+
+        try:
+            active_seq_mask = self.active_seq_mask
+        except RuntimeError:
+            # ignore runtime error may caused by accessing active_seq_mask at the first step
+            active_seq_mask = torch.ones(
+                (B,), dtype=torch.bool, device=current_steps.device
+            )
 
         assert (
-            torch.unique(refresh_prompt[can_generate]).numel() <= 1
-            and torch.unique(refresh_response[can_generate]).numel() <= 1
+            torch.unique(refresh_prompt[active_seq_mask]).numel() <= 1
+            and torch.unique(refresh_response[active_seq_mask]).numel() <= 1
         ), "All unfinished sequences must have the same refresh schedule."
 
-        if refresh_prompt[can_generate].numel() > 0:
-            self.refresh_prompt = refresh_prompt[can_generate][0].item()
-            self.refresh_response = refresh_response[can_generate][0].item()
-            self.can_generate = can_generate
+        if refresh_prompt[active_seq_mask].numel() > 0:
+            self.refresh_prompt = refresh_prompt[active_seq_mask][0].item()
+            self.refresh_response = refresh_response[active_seq_mask][0].item()

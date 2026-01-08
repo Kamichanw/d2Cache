@@ -132,17 +132,14 @@ def pre_initialize(cfg: DictConfig) -> dict:
     Pre-initialize the environment and configuration. Returns a dictionary with additional configurations.
     """
     sys.path.insert(0, str(Path(__file__).parents[2] / "configs"))
-    import src.generation
+    import src.generation # triger registration of all generation methods
     from gen_args import get_generation_args  # type: ignore
 
     # basic environment settings
     load_dotenv()
     set_seed(cfg.seed)
     logger.remove()
-    logger.add(
-        sys.stderr,
-        filter=LoggerFilter(),
-    )
+    logger.add(sys.stderr, filter=LoggerFilter())
     warnings.filterwarnings("ignore", category=PickleWarning)
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="No device id is provided via.*"

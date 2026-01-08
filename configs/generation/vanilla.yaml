@@ -16,4 +16,7 @@ top_k: null
 # The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
 sigma: null 
 
+# whether to stop generation when meets the EOS token
+stop_until_eot: false
+
 output_probs: false

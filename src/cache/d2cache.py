@@ -93,6 +93,7 @@ class d2Cache(dCache):
                 ctx.v = self.value_cache[layer_idx][self.active_seq_mask]
 
             if layer_idx == 0:
+                # cache common variables sharing among layers
                 self._q_position_ids, self._kv_position_ids = (
                     AttentionContext.select_position_ids(
                         position_ids, self.active_q_mask

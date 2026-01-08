@@ -154,9 +154,17 @@ class EvalMDLM(TemplateLM):
                     torch.sum(inputs["attention_mask"]).item() / batch_size  # type: ignore
                 )
                 throughput.append(timer.token_per_second(decode_record))
-                full_throughput.append(timer.token_per_second(decode_record, False))
+                full_throughput.append(
+                    timer.token_per_second(
+                        decode_record, self.cfg.generation.stop_until_eot
+                    )
+                )
                 tps.append(timer.token_per_step(decode_record))
-                full_tps.append(timer.token_per_step(decode_record, False))
+                full_tps.append(
+                    timer.token_per_step(
+                        decode_record, self.cfg.generation.stop_until_eot
+                    )
+                )
                 latency.append(timer.elapsed_time_s / batch_size)
                 final_frame: Frame = decode_record[-1]
                 generated_answer = [

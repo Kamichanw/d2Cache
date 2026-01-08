@@ -12,6 +12,10 @@ class PrefixCache(dCache):
     def __init__(self, model_config, use_dual: bool = False):
         super().__init__(model_config)
         self.use_dual = use_dual
+        self.key_cache: list[torch.Tensor] = []
+        self.value_cache: list[torch.Tensor] = []
+        self.active_q_mask: torch.Tensor | None = None
+        self._new_block_start = False
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
@@ -23,6 +27,7 @@ class PrefixCache(dCache):
                     # the active_q_mask accordingly.
                     self.active_q_mask = self.active_q_mask[0].expand(B, -1)
                 ctx.x = x[self.active_q_mask].view(B, -1, C)
+
             yield ctx
 
             if self.active_q_mask is not None:
@@ -59,6 +64,9 @@ class PrefixCache(dCache):
                 # the first forward pass, store states as cache
                 self.key_cache.append(ctx.k)
                 self.value_cache.append(ctx.v)
+            elif self._new_block_start:
+                self.key_cache[layer_idx][self.active_seq_mask] = ctx.k
+                self.value_cache[layer_idx][self.active_seq_mask] = ctx.v
             else:
                 assert self.active_q_mask is not None
                 if layer_idx == 0:
@@ -77,6 +85,7 @@ class PrefixCache(dCache):
                 ctx.v = self.value_cache[layer_idx][self.active_seq_mask]
 
             if layer_idx == 0:
+                # cache common variables sharing among layers
                 self._q_position_ids, self._kv_position_ids = (
                     AttentionContext.select_position_ids(
                         position_ids, self.active_q_mask
@@ -106,8 +115,10 @@ class PrefixCache(dCache):
                 q_mask = F.pad(q_mask[:, 1:], (0, 1), value=False)
 
             self.active_q_mask = q_mask
+        self._new_block_start = False
 
     def on_block_start(self, block_mask: torch.Tensor, frame: Frame):
-        self.key_cache: list[torch.Tensor] = []
-        self.value_cache: list[torch.Tensor] = []
-        self.active_q_mask: torch.Tensor | None = None
+        # we set the internal flag `_new_block_start` instead of cleaning caches as empty list,
+        # as the original batch-dim of caches must be kept.
+        self._new_block_start = True
+        self.active_q_mask = None
