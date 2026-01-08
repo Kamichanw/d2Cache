@@ -3,7 +3,11 @@ import torch
 import torch.nn.functional as F
 
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
-from src.generation.utils import prepare_logits_for_generation, sample_tokens
+from src.generation.utils import (
+    check_can_generate,
+    prepare_logits_for_generation,
+    sample_tokens,
+)
 from src.generation.vanilla import confidence_unmasking
 from src.utils import certainty_density, register
 
@@ -19,7 +23,9 @@ def wino_generate_step(
     top_p: float | None = None,
     top_k: float | None = None,
     mask_token_id: int = None,  # type: ignore
+    eot_token_id: int | None = None,
     sigma: float | None = None,
+    stop_until_eot: bool = False,
     # PC sampler
     debias: bool = False,
     clip_alpha: float | None = None,
@@ -38,12 +44,20 @@ def wino_generate_step(
     block_end = block_indices[-1].item() + 1
     block_length = int(block_end - block_start)
 
-    remaining_mask = frame.generated_tokens == mask_token_id
-    transfer_index_mask = remaining_mask.clone()
-    can_generate = (block_mask & transfer_index_mask).any(dim=-1)
+    can_generate = check_can_generate(
+        frame,
+        eligible_mask=block_mask,
+        num_transfer_tokens=1,
+        stop_until_eot=stop_until_eot,
+        mask_token_id=mask_token_id,
+        eot_token_id=eot_token_id,
+    )
 
     if not torch.any(can_generate):
         return None
+    
+    remaining_mask = frame.generated_tokens == mask_token_id
+    transfer_index_mask = remaining_mask.clone()
 
     # filtered inputs
     prompts_active = frame.prompts[can_generate]
@@ -80,7 +94,7 @@ def wino_generate_step(
         .clone()
     )
 
-    # Apply Wino mask constraints
+    # ----- apply wino mask constraints -----
     # nothing attends to shadow block (except shadow block itself)
     final_mask[:, :, :-block_length, -block_length:] = False
 
@@ -91,6 +105,7 @@ def wino_generate_step(
         block_length, device=device, dtype=torch.bool
     )
 
+    # ----- forward with the shadow block -----
     outputs = model(
         x,
         attention_mask=final_mask,
@@ -132,12 +147,14 @@ def wino_generate_step(
     )
     confidence = torch.where(block_mask_curr, combined_conf, current_conf)
 
-    # Unmasking (Wide In)
+    # ----- unmasking (wide in) -----
     scores = torch.where(block_mask_curr, confidence, -torch.inf)
     if sigma is not None and sigma > 0:
         scores = (
             confidence
-            * certainty_density(~remaining_mask, sigma=sigma)[:, block_start:block_end]
+            * certainty_density(~remaining_mask[can_generate], sigma=sigma)[
+                :, block_start:block_end
+            ]
         )
     selected_indices = confidence_unmasking(
         scores=scores,
@@ -146,7 +163,9 @@ def wino_generate_step(
             active_batch_size, device=scores.device, dtype=torch.long
         ),
         max_transfer_tokens=torch.clamp(
-            (block_mask_curr.sum(dim=1) * 0.7).int(), min=5, max=20
+            (block_mask_curr.sum(dim=1) * 0.7).int(),
+            min=5,
+            max=20,  # adopted from the official implementation
         ),
         threshold=wide_in_thres,
     )
@@ -159,7 +178,7 @@ def wino_generate_step(
     unmask_mask = torch.zeros_like(transfer_index_mask[can_generate], dtype=torch.bool)
     unmask_mask[:, block_start:block_end] = unmask_mask_block
 
-    # Remasking (Narrow Out)
+    # ----- remasking (narrow out) -----
     remask_mask = torch.zeros_like(unmask_mask)
     current_wide_in = unmask_mask_block.sum(dim=1)
     num_last_wide_in[can_generate] = current_wide_in
@@ -238,9 +257,9 @@ def wino_generate_step(
         probs_ext[:, block_start:block_end] = torch.where(
             block_mask_curr.unsqueeze(-1), p, -torch.inf
         )
-        fake_prob = torch.zeros((p.size(-1),), device=device, dtype=p.dtype)
-        fake_prob[mask_token_id] = 1.0
-        probs_ext[remask_mask] = fake_prob.unsqueeze(0)
+        dummy_probs = torch.zeros((p.size(-1),), device=device, dtype=p.dtype)
+        dummy_probs[mask_token_id] = 1.0
+        probs_ext[remask_mask] = dummy_probs.unsqueeze(0)
 
     return FrameDelta(
         transfer_index=transfer_index,
@@ -268,6 +287,8 @@ def wino_generate(
     sigma: float | None = None,
     mask_token_id: int | None = None,
     pad_token_id: int | None = None,
+    eot_token_id: int | None = None,
+    stop_until_eot: bool = False,
     # wino
     wide_in_thres: float = 0.6,
     narrow_out_thres: float = 0.9,
@@ -284,6 +305,12 @@ def wino_generate(
         raise ValueError(
             "mask_token_id and pad_token_id must be provided either as arguments or environment variables."
         )
+    if stop_until_eot:
+        if eot_token_id is None and os.environ.get("EOT_TOKEN_ID", None) is None:
+            raise ValueError(
+                "eot_token_id must be provided either as an argument or an environment variable if stop_until_eot is set to True."
+            )
+        eot_token_id = eot_token_id or int(os.environ.get("EOT_TOKEN_ID"))  # type: ignore
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -297,7 +324,10 @@ def wino_generate(
     if attention_mask is None:
         attention_mask = (input_ids != pad_token_id).long()
 
-    attention_mask = F.pad(attention_mask, (0, gen_length), value=1).to(model.device)
+    if attention_mask.shape == input_ids.shape:
+        attention_mask = F.pad(attention_mask, (0, gen_length), value=1).to(
+            model.device
+        )
 
     frame = initial_frame
     deltas = []
@@ -327,6 +357,8 @@ def wino_generate(
                 top_p=top_p,
                 top_k=top_k,
                 sigma=sigma,
+                eot_token_id=eot_token_id,
+                stop_until_eot=stop_until_eot,
                 mask_token_id=mask_token_id,
                 wide_in_thres=wide_in_thres,
                 narrow_out_thres=narrow_out_thres,

@@ -6,7 +6,11 @@ from typing import Type
 
 from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
-from src.generation.utils import prepare_logits_for_generation, sample_tokens
+from src.generation.utils import (
+    prepare_logits_for_generation,
+    sample_tokens,
+    check_can_generate,
+)
 from src.utils import certainty_density, register
 from src.generation.vanilla import get_num_transfer_tokens, confidence_unmasking
 
@@ -28,7 +32,9 @@ def generate_step(
     top_p: float | None = None,
     top_k: float | None = None,
     mask_token_id: int = None,  # type: ignore
+    eot_token_id: int | None = None,
     sigma: float | None = None,
+    stop_until_eot: bool = False,
     # parallel decoding
     threshold: float | None = None,
     factor: float | None = None,
@@ -52,13 +58,10 @@ def generate_step(
         output_hidden_states: Whether to return the hidden states of all decoded tokens.
         output_probs: Whether to return the probabilities of the decoded tokens.
     """
-    if threshold is not None and factor is not None:
-        raise ValueError(
-            "Only one of `threshold` or `factor` can be specified, not both."
-        )
-
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
+    gen_length = frame.generated_tokens.size(1)
+    device = block_mask.device
 
     if isinstance(num_transfer_tokens, torch.Tensor):
         if num_transfer_tokens.numel() != batch_size or num_transfer_tokens.dim() != 1:
@@ -68,20 +71,23 @@ def generate_step(
             )
     else:
         num_transfer_tokens = torch.full(
-            (batch_size,),
-            num_transfer_tokens,
-            device=block_mask.device,
-            dtype=torch.long,
+            (batch_size,), num_transfer_tokens, device=device, dtype=torch.long
         )
+
+    can_generate = check_can_generate(
+        frame,
+        eligible_mask=block_mask,
+        num_transfer_tokens=num_transfer_tokens,
+        stop_until_eot=stop_until_eot,
+        mask_token_id=mask_token_id,
+        eot_token_id=eot_token_id,
+    )
+    if not torch.any(can_generate):
+        return None
 
     remaining_mask = frame.generated_tokens == mask_token_id
     transfer_index_mask = remaining_mask.clone()
-    can_generate = (block_mask & transfer_index_mask).any(dim=-1)
-    if not torch.any(can_generate):
-        return None
-    # skip sequence that doesn't require to generate
-    can_generate &= num_transfer_tokens > 0
-
+    
     if past_key_values is not None:
         past_key_values.active_seq_mask = can_generate
 
@@ -125,7 +131,9 @@ def generate_step(
         transfer_index_mask[can_generate], confidence, -torch.inf
     )
     if sigma is not None and sigma > 0:
-        scores = confidence * certainty_density(~remaining_mask, sigma=sigma)
+        scores = confidence * certainty_density(
+            ~remaining_mask[can_generate], sigma=sigma
+        )
 
     # ----------------------------- Klass-specific logic -----------------------------
     eps = 1e-12
@@ -172,7 +180,7 @@ def generate_step(
         (
             next(transfer_index_iter)
             if is_not_finished
-            else torch.tensor([], dtype=torch.long, device=x0.device)
+            else torch.tensor([], dtype=torch.long, device=device)
         )
         for is_not_finished in can_generate
     )
@@ -210,6 +218,8 @@ def klass_generate(
     sigma: float | None = None,
     mask_token_id: int | None = None,
     pad_token_id: int | None = None,
+    eot_token_id: int | None = None,
+    stop_until_eot: bool = False,
     # klass
     kl_threshold: float = 0.01,
     kl_history_length: int = 2,
@@ -229,6 +239,12 @@ def klass_generate(
             "mask_token_id must be provided either as an argument or an environment variable."
         )
     mask_token_id = mask_token_id or int(os.environ.get("MASK_TOKEN_ID"))  # type: ignore
+    if stop_until_eot:
+        if eot_token_id is None and os.environ.get("EOT_TOKEN_ID", None) is None:
+            raise ValueError(
+                "eot_token_id must be provided either as an argument or an environment variable if stop_until_eot is set to True."
+            )
+        eot_token_id = eot_token_id or int(os.environ.get("EOT_TOKEN_ID"))  # type: ignore
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -245,7 +261,7 @@ def klass_generate(
     if attention_mask is None and pad_token_id is not None:
         attention_mask = (input_ids != pad_token_id).long()
 
-    if attention_mask is not None:
+    if attention_mask is not None and attention_mask.shape == input_ids.shape:
         attention_mask = F.pad(attention_mask, (0, gen_length), value=1).to(
             model.device
         )
@@ -301,6 +317,8 @@ def klass_generate(
                 top_k=top_k,
                 sigma=sigma,
                 mask_token_id=mask_token_id,
+                eot_token_id=eot_token_id,
+                stop_until_eot=stop_until_eot,
                 threshold=threshold,
                 factor=factor,
                 output_hidden_states=output_hidden_states,
