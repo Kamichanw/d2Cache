@@ -1,0 +1,6 @@
+defaults:
+  - llada-common
+  - _self_
+
+name: llada-1.5
+path: ${oc.env:LLADA_1_5_PATH}

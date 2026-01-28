@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import math
 import sys
 from abc import abstractmethod
@@ -21,8 +20,9 @@ from torch import einsum
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils.generic import ModelOutput
 from transformers.models.auto import AutoModel
+from transformers.utils import logging
 
-from ...cache import dCache
+from ...cache import dCache, d2Cache
 from .configuration_llada import (
     LLaDAConfig,
     StrEnum,
@@ -60,7 +60,7 @@ __all__ = [
 ]
 
 
-log = logging.getLogger(__name__)
+log = logging.get_logger(__name__)
 
 
 class ModuleType(StrEnum):
@@ -526,6 +526,7 @@ class LLaDABlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Computes scaled dot product attention on query, key and value tensors, using an optional
@@ -549,8 +550,15 @@ class LLaDABlock(nn.Module):
             attn_weights = nn.functional.dropout(
                 attn_weights, p=dropout_p, training=self.training
             )
-            return torch.matmul(attn_weights, v), attn_weights
+            return torch.matmul(attn_weights, v), (
+                attn_weights if output_attentions else None
+            )
         else:
+            if output_attentions:
+                log.warning_once(  # type: ignore
+                    "`sdpa` attention does not support `output_attentions=True`."
+                    " Please set your attention to `eager` if you want any of these features."
+                )
             # Modify: MDM set causal to False, and with no attn_mask.
             return (
                 F.scaled_dot_product_attention(
@@ -572,6 +580,7 @@ class LLaDABlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         q_position_ids: Optional[torch.Tensor] = None,
         kv_position_ids: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
@@ -606,6 +615,7 @@ class LLaDABlock(nn.Module):
             attn_mask=attention_mask,
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
+            output_attentions=output_attentions,
         )
 
         # Re-assemble all head outputs side-by-side.
@@ -621,7 +631,8 @@ class LLaDABlock(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[dCache] = None,
-    ) -> torch.Tensor:
+        output_attentions: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         raise NotImplementedError
 
     @classmethod
@@ -692,7 +703,8 @@ class LLaDALlamaBlock(LLaDABlock):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[dCache] = None,
-    ) -> torch.Tensor:
+        output_attentions: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Get query, key, value projections.
         # shape:
         #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
@@ -735,11 +747,14 @@ class LLaDALlamaBlock(LLaDABlock):
                     ctx.attention_mask,
                     q_position_ids=ctx.q_position_ids,
                     kv_position_ids=ctx.kv_position_ids,
+                    output_attentions=bool(output_attentions)
+                    or isinstance(past_key_values, d2Cache),
                 )
             else:
                 ctx.o, ctx.attn_weight = torch.empty_like(ctx.q), None
 
         q, k, v, o = ctx.q, ctx.k, ctx.v, ctx.o  # keep them for visualization
+        attn_weight = ctx.attn_weight
         x = ctx.residual + self.dropout(ctx.o)
 
         # Add feed-forward projection.
@@ -753,7 +768,7 @@ class LLaDALlamaBlock(LLaDABlock):
             ctx.ffn_out = x
 
         x = ctx.residual + self.dropout(ctx.ffn_out)
-        return x
+        return x, attn_weight
 
 
 @dataclass
@@ -979,6 +994,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1005,13 +1021,10 @@ class LLaDAModel(LLaDAPreTrainedModel):
         assert self.config.rope, "Rope must be used in Llama-Encoder for MDM."
         assert self.config.block_group_size == 1
 
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else False
-        )
         # create a dummy cache to simplify code
         past_key_values = past_key_values or dCache(self.config)
         batch_size, seq_len = (
-            input_ids.size() # type: ignore
+            input_ids.size()  # type: ignore
             if inputs_embeds is None
             else inputs_embeds.size()[:2]
         )
@@ -1049,6 +1062,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
         x = self.transformer.emb_drop(x)  # type: ignore
 
         # decoder layers
+        all_attentions = []
         all_hidden_states = []
 
         with past_key_values.model_forward(x) as ctx:
@@ -1057,22 +1071,27 @@ class LLaDAModel(LLaDAPreTrainedModel):
             for block in self.transformer.blocks:  # type: ignore
                 if output_hidden_states:
                     all_hidden_states.append(x)
-
                 if self.gradient_checkpointing and self.training:
-                    x = self._gradient_checkpointing_func(
+                    layer_outputs = self._gradient_checkpointing_func(
                         block.__call__,
                         x,
                         attention_mask,
                         position_ids,
                         None,  # past_key_values must be None for checkpointing
+                        output_attentions,
                     )
                 else:
-                    x = block(
+                    layer_outputs = block(
                         x,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
                         past_key_values=past_key_values,
+                        output_attentions=output_attentions,
                     )
+
+                x = layer_outputs[0]
+                if output_attentions:
+                    all_attentions.append(layer_outputs[1])
 
             # Apply final layer norm.
             # shape: (batch_size, seq_len, d_model)
@@ -1091,7 +1110,11 @@ class LLaDAModel(LLaDAPreTrainedModel):
                 logits.mul_(1 / math.sqrt(self.config.d_model))
             ctx.logits = logits
 
-        return LLaDAOutput(logits=ctx.logits, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        return LLaDAOutput(
+            logits=cast(torch.FloatTensor, ctx.logits),
+            hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
+            attentions=tuple(all_attentions) if output_attentions else None,
+        )
 
 
 class LLaDAModelLM(LLaDAPreTrainedModel):
@@ -1107,16 +1130,16 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.model.transformer.wte # type: ignore
+        return self.model.transformer.wte  # type: ignore
 
     def set_input_embeddings(self, value: nn.Module):
         self.model.transformer.wte = value
 
     def get_output_embeddings(self) -> nn.Module:
         if self.config.weight_tying:
-            return self.model.transformer.wte # type: ignore
+            return self.model.transformer.wte  # type: ignore
         else:
-            return self.model.transformer.ff_out # type: ignore
+            return self.model.transformer.ff_out  # type: ignore
 
     def set_output_embeddings(self, new_embeddings: nn.Module):
         if self.config.weight_tying:
@@ -1149,9 +1172,6 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = dCache(self.config)
 
-        if output_attentions:
-            raise ValueError("output_attentions is not yet supported in LLaDA")
-
         outputs = self.model.forward(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1160,6 +1180,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,  # type: ignore[arg-type]
             output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
         )
 
         logits = outputs.logits
@@ -1178,6 +1199,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         return LLaDAOutputWithPast(
             loss=loss,
             logits=logits,
+            attentions=outputs.attentions if output_attentions else None,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=hidden_states,
         )

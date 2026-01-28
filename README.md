@@ -47,6 +47,7 @@ The following models are supported out-of-the-box:
 | Model | Paper | Original Code Repo |
 |:---|:---:|:---:|
 | LLaDA-8B (`llada-base`, `llada-inst`) | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
+| LLaDA-1.5 (`llada-1.5`) | <a href="https://arxiv.org/abs/2505.19223"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.19223-red"></a> | <a href="https://github.com/ML-GSAI/LLaDA-1.5"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA-1.5?style=social&label=Stars"></a> |
 | Dream-v0-7B (`dream-base`, `dream-inst`) | <a href="https://arxiv.org/abs/2508.15487"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.15487-red"></a> | <a href="https://github.com/DreamLM/Dream"><img alt="Static Badge" src="https://img.shields.io/github/stars/DreamLM/Dream?style=social&label=Stars"></a> |
 
 ## KV Caching
@@ -54,9 +55,9 @@ The corresponding usages can be found [here](./docs/kv_caching.md).
 
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|
-| PrefixCache / DualCache | <a href="https://arxiv.org/abs/2505.22618"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/NVLabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
+| PrefixCache / DualCache | <a href="https://arxiv.org/abs/2505.22618 "> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2505.22618-58C9ED"> </a> | <a href="https://github.com/NVLabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
 | dLLM Cache | <a href="https://arxiv.org/abs/2506.06295"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2506.06295-red"></a> | <a href="https://github.com/maomaocun/dLLM-Cache"><img alt="Static Badge" src="https://img.shields.io/github/stars/maomaocun/dLLM-Cache?style=social&label=Stars"></a> |
-| d2Cache | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2509.23094-red"></a> | This Repo |
+| d2Cache | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2509.23094-58C9ED"> </a> | This Repo |
 
 ## Decoding Strategies
 The corresponding usages can be found [here](./docs/decoding_strategies.md).
@@ -64,13 +65,13 @@ The corresponding usages can be found [here](./docs/decoding_strategies.md).
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|
 | Vanilla / Semi-AR | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
-| Parallel | <a href="https://arxiv.org/abs/2505.22618"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.22618-red"></a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVlabs/Fast-dLLM?style=social&label=Stars"></a> |
+| Parallel | <a href="https://arxiv.org/abs/2505.22618"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2505.22618-58C9ED"> </a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
 | PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.13021-red"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/github/stars/NEUIR/PC-Sampler?style=social&label=Stars"></a> |
-| Certainty Prior Decoding | <a href="https://arxiv.org/abs/2509.23094"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2509.23094-red"></a> | This Repo|
-|DAEDAL |<a href="https://arxiv.org/abs/2508.00819"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.00819-red"></a> | <a href="https://github.com/Li-Jinsong/DAEDAL"><img alt="Static Badge" src="https://img.shields.io/github/stars/Li-Jinsong/DAEDAL?style=social&label=Stars"></a> |
+| Certainty Prior Decoding | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2509.23094-58C9ED"> </a> | This Repo|
+|DAEDAL | <a href="https://arxiv.org/abs/2508.00819"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2508.00819-58C9ED"> </a> | <a href="https://github.com/Li-Jinsong/DAEDAL"><img alt="Static Badge" src="https://img.shields.io/github/stars/Li-Jinsong/DAEDAL?style=social&label=Stars"></a> |
 | KLASS | <a href="https://arxiv.org/abs/2511.05664"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Spotlight-2511.05664-purple"></a> | <a href="https://github.com/shkim0116/KLASS"><img alt="Static Badge" src="https://img.shields.io/github/stars/shkim0116/KLASS?style=social&label=Stars"></a> |
 | EB-Sampler | <a href="https://arxiv.org/abs/2505.24857"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS-2511.05664-purple"></a> | Not release |
-| WINO | <a href="https://arxiv.org/abs/2507.18578"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2511.05664-red"></a> | <a href="https://github.com/shkim0116/KLASS"><img alt="Static Badge" src="https://img.shields.io/github/stars/Feng-Hong/WINO-DLLM?style=social&label=Stars"> |
+| WINO | <a href="https://arxiv.org/abs/2507.18578"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2507.18578-58C9ED"> </a> | <a href="https://github.com/Feng-Hong/WINO-DLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/Feng-Hong/WINO-DLLM?style=social&label=Stars"></a> |
 # Setup
 ```bash
 # Create and activate the environment
@@ -93,6 +94,7 @@ A quick example is shown in [srcipts/run_eval.sh](./scripts/run_eval.sh).
 Available models:
 - llada-base: GSAI-ML/LLaDA-8B-Base
 - llada-inst: GSAI-ML/LLaDA-8B-Instruct
+- llada-1.5: GSAI-ML/LLaDA-1.5
 - dream-base: Dream-org/Dream-v0-Base-7B
 - dream-inst: Dream-org/Dream-v0-Instruct-7B
 
