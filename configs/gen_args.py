@@ -149,6 +149,14 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
     match model:
         case "dream-base" | "dream-inst":
             top_p = 0.9
+        case model if model.startswith("sdar"):
+            # SDAR block diffusion defaults (see SDAR repo `generate.py`)
+            block_length = 4
+            # keep `steps=gen_length` so that per-block denoising steps can be derived as:
+            # denoising_steps = steps // (gen_length // block_length) == block_length
+            temperature = 1.0
+            top_p = 0.95
+            top_k = 50
 
     return GenerationArgs(
         gen_length=gen_length,

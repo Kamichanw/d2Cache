@@ -8,25 +8,33 @@ def load_pretrained_model(cfg: DictConfig, **model_kwargs) -> PreTrainedModel:
     """
     Load a pretrained model based on the configuration.
     """
-    from ..models import LLaDAModelLM, DreamModel
+    from ..models import LLaDAModelLM, DreamModel, SDARForCausalLM
 
     model_family = cfg.model.name.split("-")[0]
     if model_family == "llada":
         return LLaDAModelLM.from_pretrained(cfg.model.path, **model_kwargs)
     elif model_family == "dream":
         return DreamModel.from_pretrained(cfg.model.path, **model_kwargs)
+    elif model_family == "sdar":
+        # Prefer the in-repo SDAR implementation (avoids `trust_remote_code`).
+        # Avoid overriding SDAR's attention implementation (often "flex_attention") via global config.
+        model_kwargs.pop("attn_implementation", None)
+        model_kwargs.pop("trust_remote_code", None)
+        return SDARForCausalLM.from_pretrained(cfg.model.path, **model_kwargs)
 
     raise ValueError(f"Unsupported pretrained model: {cfg.model.name}")
 
 
 def load_eval_model(cfg: DictConfig, **model_kwargs):
-    from ..models import LLaDAEval, DreamEval
+    from ..models import LLaDAEval, DreamEval, SDAREval
 
     model_family = cfg.model.name.split("-")[0]
     if model_family == "llada":
         eval_model = LLaDAEval(cfg, **model_kwargs)
     elif model_family == "dream":
         eval_model = DreamEval(cfg, **model_kwargs)
+    elif model_family == "sdar":
+        eval_model = SDAREval(cfg, **model_kwargs)
     else:
         raise NotImplementedError(
             f"Model family {model_family} is not implemented for evaluation."
@@ -72,4 +80,8 @@ def load_tokenizer(cfg: DictConfig, **tokenizer_kwargs):
             tokenizer.eot_token_id = tokenizer.convert_tokens_to_ids(
                 tokenizer.eot_token
             )
+        case "sdar":
+            # SDAR relies on mask_token_id for block diffusion; expose it on the tokenizer.
+            # Some tokenizers don't define a mask token, but we only need the id.
+            tokenizer.mask_token_id = cfg.generation.mask_token_id  # type: ignore[attr-defined]
     return tokenizer

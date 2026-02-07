@@ -1,0 +1,22 @@
+# SDAR block-diffusion decoding.
+# Most defaults (gen_length/block_length/steps/top_p, etc.) are filled by `configs/gen_args.py`
+strategy: sdar
+
+# SDAR remasking / unmasking strategies (from SDAR repo `generate.py`)
+remasking_strategy: low_confidence_dynamic
+confidence_threshold: 0.85
+eb_threshold: 0.35
+
+alg: "maskgit_plus"
+gen_length: null
+block_length: null
+steps: null
+temperature: 1.0
+top_p: 0.95
+top_k: 50
+
+# Stop when the first EOS is generated; remaining masks (if any) are replaced with EOS.
+stop_until_eot: true
+
+output_probs: false
+
