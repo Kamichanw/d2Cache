@@ -1,4 +1,3 @@
-import inspect
 import os
 import re
 import shutil
@@ -11,7 +10,6 @@ import warnings
 from importlib.metadata import version
 
 from pathlib import Path
-from typing import Callable
 from accelerate.utils import set_seed
 from contextlib import contextmanager
 from omegaconf import DictConfig, OmegaConf
@@ -97,20 +95,6 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
         logger.info("Environment restored.")
 
 
-def find_incompatible_kwargs(input_kwargs: dict, target_fn: Callable) -> tuple:
-    """
-    Returns a tuple of keyword arguments in `input_kwargs` that are not compatible
-    with the signature of `target_fn`.
-    """
-    sig = inspect.signature(target_fn)
-    params = sig.parameters
-    if all(p.kind != p.VAR_KEYWORD for p in params.values()) and (
-        unknown_args := set(input_kwargs) - set(params)
-    ):
-        return tuple(unknown_args)
-    return tuple()
-
-
 def get_config_diff(d1: dict, d2: dict) -> dict:
     """Compare dict d1 and d2 recursively, and returns the d1 - d2."""
     diff = {}
@@ -178,7 +162,7 @@ def pre_initialize(cfg: DictConfig) -> dict:
         )
 
     os.environ["MASK_TOKEN_ID"] = str(cfg.generation.mask_token_id)
-    os.environ["EOT_TOKEN_ID"] = str(cfg.generation.eot_token_id)
+    os.environ["EOS_TOKEN_ID"] = str(cfg.generation.eos_token_id)
     os.environ["PAD_TOKEN_ID"] = str(cfg.generation.pad_token_id)
 
     extra_gen_kwargs = {}

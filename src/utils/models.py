@@ -2,6 +2,7 @@ import transformers
 
 from omegaconf import DictConfig
 from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
 
 
 def load_pretrained_model(cfg: DictConfig, **model_kwargs) -> PreTrainedModel:
@@ -12,11 +13,13 @@ def load_pretrained_model(cfg: DictConfig, **model_kwargs) -> PreTrainedModel:
 
     model_family = cfg.model.name.split("-")[0]
     if model_family == "llada":
-        return LLaDAModelLM.from_pretrained(cfg.model.path, **model_kwargs)
+        model = LLaDAModelLM.from_pretrained(cfg.model.path, **model_kwargs)
     elif model_family == "dream":
-        return DreamModel.from_pretrained(cfg.model.path, **model_kwargs)
+        model = DreamModel.from_pretrained(cfg.model.path, **model_kwargs)
+    else:
+        raise ValueError(f"Unsupported pretrained model: {cfg.model.name}")
 
-    raise ValueError(f"Unsupported pretrained model: {cfg.model.name}")
+    return model
 
 
 def load_eval_model(cfg: DictConfig, **model_kwargs):
@@ -73,3 +76,27 @@ def load_tokenizer(cfg: DictConfig, **tokenizer_kwargs):
                 tokenizer.eot_token
             )
     return tokenizer
+
+
+def is_adapted_from_ar(
+    model_or_config: PreTrainedModel | PretrainedConfig,
+) -> bool:
+    """
+    Check if a model or its configuration is adapted from an autoregressive architecture.
+    """
+
+    if isinstance(model_or_config, PreTrainedModel):
+        config = model_or_config.config
+    elif isinstance(model_or_config, PretrainedConfig):
+        config = model_or_config
+    else:
+        raise ValueError(
+            f"Expected model_or_config to be an instance of PreTrainedModel or PretrainedConfig, but got {type(model_or_config)}"
+        )
+
+    if config.model_type.lower() == "llada":
+        return False
+    elif config.model_type.lower() == "dream":
+        return True
+    else:
+        raise ValueError(f"Unsupported model type: {config.model_type}")

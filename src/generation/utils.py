@@ -1,21 +1,29 @@
-import os
 import re
 import torch
 import torch.distributions as dists
 
-from src.frame import PLACEHOLDER_STEP, Frame
+from src.frame import Frame
 from src.models.dream.generation_utils import top_k_logits, top_p_logits
+from src.third_party import get_token_freq
+from src.utils import is_adapted_from_ar, Registry
 
+register = Registry()
 
 def prepare_logits_for_generation(model, logits: torch.Tensor):
     """Prepare logits for unmasking."""
     from src.models import LLaDAModelLM, DreamModel
 
+    global _token_freq
     if isinstance(model, LLaDAModelLM):
-        ...
+        # well... here may not be the best place to initialize token freq for PC sampler.
+        _token_freq = get_token_freq("llada", model.config.vocab_size)
     elif isinstance(model, DreamModel):
+        _token_freq = get_token_freq("dream", model.config.vocab_size)
+    
+    if is_adapted_from_ar(model):
         # main difference with LLaDA, see https://github.com/DreamLM/Dream/issues/31
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+    
     return logits
 
 
@@ -39,9 +47,9 @@ def decode_final_frame(
 
     can_generate = check_can_generate(
         frame,
-        stop_until_eot=True,  # we only want to check tokens before the first EOS in this case
+        stop_until_eos=True,  # we only want to check tokens before the first EOS in this case
         mask_token_id=tokenizer.mask_token_id,
-        eot_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
     if can_generate.any():
         raise ValueError(
@@ -77,6 +85,7 @@ def decode_final_frame(
     return texts if final_frame.is_batched else texts[0]
 
 
+# cache token frequency for debiasing trivial tokens in sampling
 _token_freq: torch.Tensor | None = None
 
 
@@ -113,6 +122,7 @@ def sample_tokens(
         alpha = clip_alpha if clip_alpha is not None else 10.0
         if _token_freq is None:
             raise ValueError("Token frequency not initialized for debiasing.")
+        _token_freq = _token_freq.to(device=logits.device, dtype=logits.dtype)
         confidence = torch.clamp_max(
             -confidence * torch.log(_token_freq[x0] + epsilon), max=alpha
         )
@@ -141,13 +151,13 @@ def check_can_generate(
     frame: Frame,
     eligible_mask: torch.Tensor | None = None,
     num_transfer_tokens: int | torch.Tensor | None = None,
-    stop_until_eot: bool = False,
+    stop_until_eos: bool = False,
     mask_token_id: int | None = None,
-    eot_token_id: int | None = None,
+    eos_token_id: int | None = None,
 ):
     """
     Check whether a frame can perform generation. A frame can continue generate if positions where eligible_mask is True:
-    1. all tokens before the first EOS are unmasked if stop_until_eot is true, else
+    1. all tokens before the first EOS are unmasked if stop_until_eos is true, else
     2. all masked tokens are converted to certain tokens.
     3. num_transfer_tokens > 0 if num_transfer_tokens is provided.
     """
@@ -171,21 +181,21 @@ def check_can_generate(
         eligible_mask = torch.ones_like(frame.generated_tokens)
 
     # condition 1
-    if stop_until_eot:
-        if eot_token_id is None:
+    if stop_until_eos:
+        if eos_token_id is None:
             raise ValueError(
-                "eot_token_id must be specified if stop_until_eos is True."
+                "eos_token_id must be specified if stop_until_eos is True."
             )
-        # check if all tokens before EOT have been generated
-        eot_mask = frame.generated_tokens == eot_token_id
-        first_eot_idx = torch.where(
-            eot_mask.any(dim=-1, keepdim=True),
-            eot_mask.int().argmax(dim=-1, keepdim=True),
+        # check if all tokens before EOS have been generated
+        eos_mask = frame.generated_tokens == eos_token_id
+        first_eos_idx = torch.where(
+            eos_mask.any(dim=-1, keepdim=True),
+            eos_mask.int().argmax(dim=-1, keepdim=True),
             gen_length,
         )
         eligible_mask &= (
             torch.arange(gen_length, device=device).unsqueeze(0).expand(batch_size, -1)
-        ) < first_eot_idx
+        ) < first_eos_idx
 
     # condition 2
     if mask_token_id is not None:

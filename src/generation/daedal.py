@@ -2,41 +2,40 @@ import os
 import torch
 
 from src.frame import Frame, DecodeRecord, FrameDelta
-from src.generation.vanilla import generate_step
-from src.generation.utils import prepare_logits_for_generation
-from src.utils import register
+from src.generation.vanilla import confidence_unmasking, generate_step
+from src.generation.utils import prepare_logits_for_generation, register
 
 
-def calculate_eot_conf(
-    gen_probs: torch.Tensor, num_check_eot_tokens: int, eot_token_id: int
+def calculate_eos_conf(
+    gen_probs: torch.Tensor, num_check_eos_tokens: int, eos_token_id: int
 ):
     """
-    Calculate the average confidence of the last k EOT tokens.
+    Calculate the average confidence of the last k EOS tokens.
 
     Args:
         gen_probs: Probs tensor of shape (batch_size, sequence_length, vocab_size).
-        num_check_eot_tokens: The number (k) of last EOT tokens to check.
-        eot_token_id: The token ID for the EOT token.
+        num_check_eos_tokens: The number (k) of last EOS tokens to check.
+        eos_token_id: The token ID for the EOS token.
 
     Returns:
         A tensor of shape (batch_size,) with the average confidences.
     """
     x0 = torch.argmax(gen_probs, dim=-1)
 
-    eot_mask_reversed = torch.flip(x0 == eot_token_id, dims=[1])
-    eot_counts_reversed = torch.cumsum(eot_mask_reversed.int(), dim=1)
+    eos_mask_reversed = torch.flip(x0 == eos_token_id, dims=[1])
+    eos_counts_reversed = torch.cumsum(eos_mask_reversed.int(), dim=1)
 
     final_mask = torch.flip(
-        (eot_counts_reversed <= num_check_eot_tokens) & eot_mask_reversed, dims=[1]
+        (eos_counts_reversed <= num_check_eos_tokens) & eos_mask_reversed, dims=[1]
     )
 
     return (
-        torch.sum(gen_probs[:, :, eot_token_id] * final_mask, dim=1)
-        / num_check_eot_tokens
+        torch.sum(gen_probs[:, :, eos_token_id] * final_mask, dim=1)
+        / num_check_eos_tokens
     )
 
 
-@register.gen_strategy("daedal")
+@register("daedal")
 def daedal_generate(
     model,
     input_ids: torch.Tensor,
@@ -48,12 +47,12 @@ def daedal_generate(
     top_k: int | None = None,
     top_p: float | None = None,
     mask_token_id: int | None = None,
-    eot_token_id: int | None = None,
+    eos_token_id: int | None = None,
     pad_token_id: int | None = None,
-    initial_eot_expand_thres=0.5,
-    decode_eot_expand_thres=0.9,
+    initial_eos_expand_thres=0.5,
+    decode_eos_expand_thres=0.9,
     low_conf_expand_thres: float = 0.1,
-    num_check_last_eot: int = 32,
+    num_check_last_eos: int = 32,
     expansion_factor: int = 8,
     threshold: float = 0.9,
     factor: float | None = None,
@@ -77,11 +76,11 @@ def daedal_generate(
 
     mask_token_id = mask_token_id or int(os.environ.get("MASK_TOKEN_ID", -1))
     pad_token_id = pad_token_id or int(os.environ.get("PAD_TOKEN_ID", -1))
-    eot_token_id = eot_token_id or int(os.environ.get("EOT_TOKEN_ID", -1))
+    eos_token_id = eos_token_id or int(os.environ.get("EOS_TOKEN_ID", -1))
 
-    if -1 in [mask_token_id, pad_token_id, eot_token_id]:
+    if -1 in [mask_token_id, pad_token_id, eos_token_id]:
         raise ValueError(
-            "mask_token_id, pad_token_id, and eot_token_id must be provided either as arguments or environment variables."
+            "mask_token_id, pad_token_id, and eos_token_id must be provided either as arguments or environment variables."
         )
 
     batch_size, prompt_length = input_ids.shape
@@ -104,12 +103,12 @@ def daedal_generate(
             logits = model(x, attention_mask=(x != pad_token_id).long()).logits
         logits = prepare_logits_for_generation(model, logits)
         need_expand = (
-            calculate_eot_conf(
+            calculate_eos_conf(
                 logits[:, prompt_length:].softmax(dim=-1),
-                num_check_last_eot,
-                eot_token_id,
+                num_check_last_eos,
+                eos_token_id,
             )
-            < initial_eot_expand_thres
+            < initial_eos_expand_thres
         )
         if not need_expand.any():
             # all sequences have expanded to adequate length
@@ -125,6 +124,27 @@ def daedal_generate(
         ).to(device=model.device, dtype=model.dtype)
 
     initial_frame = frame.clone()
+
+    def unmasking_fn(
+        *,
+        active_seq_idx: torch.Tensor,
+        scores: torch.Tensor,
+        probs: torch.Tensor,
+        transfer_index_mask: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_transfer_tokens: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], dict]:
+        return (
+            confidence_unmasking(
+                scores=scores,
+                transfer_index_mask=transfer_index_mask & block_mask,
+                min_transfer_tokens=num_transfer_tokens,
+                threshold=threshold,
+                factor=factor,
+                p=probs,
+            ),
+            {"active_index": active_seq_idx},
+        )
 
     # stage 2: Iterative Denoising and Mask Insertion
     deltas = []
@@ -152,31 +172,56 @@ def daedal_generate(
                 frame=frame,
                 block_mask=block_mask,
                 num_transfer_tokens=1,
+                unmasking_fn=unmasking_fn,
                 attention_mask=attention_mask,
                 alg=alg,
                 temperature=temperature,
                 mask_token_id=mask_token_id,
                 top_p=top_p,
                 top_k=top_k,
-                threshold=threshold,
-                factor=factor,
                 output_hidden_states=output_hidden_states,
                 output_probs=True,
             )
             if delta is None:
                 break
             assert delta.probs is not None and delta.confidence is not None
-            # select sequences with 1) low eot confidence and 2) not exceeding max length
+            active_index = delta.extra.pop("active_index")
+
+            full_decoded_tokens = frame.generated_tokens.clone()
+            full_decoded_tokens[active_index] = delta.decoded_tokens
+            if frame.confidence is None:
+                raise RuntimeError("DAEDAL requires frame confidence to be tracked.")
+            full_confidence = frame.confidence.clone()
+            full_confidence[active_index] = delta.confidence
+
+            full_probs = torch.full(
+                (batch_size, int(gen_lengths.max()), delta.probs.size(-1)),
+                -torch.inf,
+                device=model.device,
+                dtype=delta.probs.dtype,
+            )
+            full_probs[active_index] = delta.probs
+
+            # select sequences with 1) low eos confidence and 2) not exceeding max length
             # (B,)
-            need_expand = (
-                calculate_eot_conf(delta.probs, num_check_last_eot, eot_token_id)
-                < decode_eot_expand_thres
-            ) & (gen_lengths < max_gen_length)
+            need_expand = torch.zeros(
+                (batch_size,), dtype=torch.bool, device=model.device
+            )
+            need_expand[active_index] = (
+                calculate_eos_conf(delta.probs, num_check_last_eos, eos_token_id)
+                < decode_eos_expand_thres
+            ) & (gen_lengths[active_index] < max_gen_length)
             # select tokens with 1) is a valid masked token and 2) low confidence
             # (B,)
-            masked_confidence = torch.where(
-                block_mask
-                & frame.generated_tokens.eq(mask_token_id)
+            masked_confidence = torch.full(
+                (batch_size, int(gen_lengths.max())),
+                torch.inf,
+                device=model.device,
+                dtype=delta.confidence.dtype,
+            )
+            masked_confidence[active_index] = torch.where(
+                block_mask[active_index]
+                & frame.generated_tokens[active_index].eq(mask_token_id)
                 & delta.confidence.less(low_conf_expand_thres),
                 delta.confidence,
                 torch.inf,
@@ -189,7 +234,7 @@ def daedal_generate(
                 )
                 expanded_generated_tokens = torch.full(
                     (batch_size, int(gen_lengths.max())),
-                    eot_token_id,
+                    eos_token_id,
                     dtype=torch.long,
                     device=model.device,
                 )
@@ -236,27 +281,27 @@ def daedal_generate(
                         )
                         # copy the part before expand_indices[i]
                         expanded_generated_tokens[i, : expand_indices[i]] = (
-                            delta.decoded_tokens[i, : expand_indices[i]]
+                            full_decoded_tokens[i, : expand_indices[i]]
                         )
                         expanded_confidence[i, : expand_indices[i] + 1] = (
-                            delta.confidence[i, : expand_indices[i] + 1]
+                            full_confidence[i, : expand_indices[i] + 1]
                         )  # keep the confidence of the expanded token
                         # copy the part after expand_indices[i]
                         expanded_generated_tokens[
                             i, expand_indices[i] + expansion_factor :
-                        ] = delta.decoded_tokens[i, expand_indices[i] + 1 :]
+                        ] = full_decoded_tokens[i, expand_indices[i] + 1 :]
                         expanded_confidence[
                             i, expand_indices[i] + expansion_factor :
-                        ] = delta.confidence[i, expand_indices[i] + 1 :]
+                        ] = full_confidence[i, expand_indices[i] + 1 :]
                         # fill <mask_token_id>
                         expanded_generated_tokens[
                             i, expand_indices[i] : expand_indices[i] + expansion_factor
                         ] = mask_token_id
                     else:
                         expanded_generated_tokens[i, : gen_lengths[i]] = (
-                            delta.decoded_tokens[i, : gen_lengths[i]]
+                            full_decoded_tokens[i, : gen_lengths[i]]
                         )
-                        expanded_confidence[i, : gen_lengths[i]] = delta.confidence[
+                        expanded_confidence[i, : gen_lengths[i]] = full_confidence[
                             i, : gen_lengths[i]
                         ]
                         # even we don't need to expand, we still insert tokens for padding

@@ -48,15 +48,13 @@ class EvalMDLM(TemplateLM):
 
         # setup custom properties
         self.cfg = cfg
-        self.throughput = None
-        self.tps = None
-        self.full_throughput = None
-        self.full_tps = None
-        self.latency = None
-        self.total_time = None
-        self.input_length = None
+        self._metrics: dict[str, float | None] = {}
         self.device = self.accelerator.device
         self.extra_gen_kwargs = kwargs.get("extra_gen_kwargs", {})
+
+    @property
+    def metrics(self) -> dict[str, float | None]:
+        return self._metrics
 
     def tok_encode(
         self, string: str, add_special_tokens: bool | None = None, **kwargs
@@ -85,7 +83,7 @@ class EvalMDLM(TemplateLM):
     @property
     def eot_token_id(self) -> int:  # type: ignore
         try:
-            return int(os.environ.get("EOT_TOKEN_ID"))  # type: ignore
+            return int(os.environ.get("EOS_TOKEN_ID"))  # type: ignore
         except TypeError:
             return self.tokenizer.eos_token_id  # type: ignore
 
@@ -156,13 +154,13 @@ class EvalMDLM(TemplateLM):
                 throughput.append(timer.token_per_second(decode_record))
                 full_throughput.append(
                     timer.token_per_second(
-                        decode_record, self.cfg.generation.stop_until_eot
+                        decode_record, self.cfg.generation.stop_until_eos
                     )
                 )
                 tps.append(timer.token_per_step(decode_record))
                 full_tps.append(
                     timer.token_per_step(
-                        decode_record, self.cfg.generation.stop_until_eot
+                        decode_record, self.cfg.generation.stop_until_eos
                     )
                 )
                 latency.append(timer.elapsed_time_s / batch_size)
@@ -190,21 +188,23 @@ class EvalMDLM(TemplateLM):
             # it will slow down the evaluation though.
             # self.accelerator.wait_for_everyone()
 
-        throughput = self.accelerator.gather_for_metrics(throughput)
-        tps = self.accelerator.gather_for_metrics(tps)
-        full_throughput = self.accelerator.gather_for_metrics(full_throughput)
-        full_tps = self.accelerator.gather_for_metrics(full_tps)
-        latency = self.accelerator.gather_for_metrics(latency)
-        input_length = self.accelerator.gather_for_metrics(input_length)
+        gathered_metrics = {
+            "throughput": self.accelerator.gather_for_metrics(throughput),
+            "tps": self.accelerator.gather_for_metrics(tps),
+            "full_throughput": self.accelerator.gather_for_metrics(full_throughput),
+            "full_tps": self.accelerator.gather_for_metrics(full_tps),
+            "latency": self.accelerator.gather_for_metrics(latency),
+            "input_length": self.accelerator.gather_for_metrics(input_length),
+        }
 
         if self.accelerator.is_main_process:
-            self.tps = sum(tps) / len(tps)
-            self.throughput = sum(throughput) / len(throughput)
-            self.full_tps = sum(full_tps) / len(full_tps)
-            self.full_throughput = sum(full_throughput) / len(full_throughput)
-            self.latency = sum(latency) / len(latency)
-            self.total_time = Timer.get_cumulative_s("eval")
-            self.input_length = sum(input_length) / len(input_length)
+            self.metrics.update(
+                {
+                    name: sum(values) / max(len(values), 1)
+                    for name, values in gathered_metrics.items()
+                }
+            )
+            self.metrics["total_time"] = Timer.get_cumulative_s("eval")
 
         return out
 

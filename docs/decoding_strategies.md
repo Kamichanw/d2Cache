@@ -163,10 +163,10 @@ Diffusion Large Language Models (DLLMs) are emerging as a powerful alternative t
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `initial_gen_length` | `int` | `64` | Initial generation length. |
-| `initial_eot_expand_thres` | `float` | `0.5` | Threshold for initial length expansion (Stage 1). |
-| `decode_eot_expand_thres` | `float` | `0.9` | Threshold for dynamic length expansion (Stage 2). |
+| `initial_eos_expand_thres` | `float` | `0.5` | Threshold for initial length expansion (Stage 1). |
+| `decode_eos_expand_thres` | `float` | `0.9` | Threshold for dynamic length expansion (Stage 2). |
 | `low_conf_expand_thres` | `float` | `0.1` | Confidence threshold for selecting expansion points. |
-| `num_check_last_eot` | `int` | `32` | Number of last tokens to check for EOT confidence. |
+| `num_check_last_eos` | `int` | `32` | Number of last tokens to check for EOS confidence. |
 | `expansion_factor` | `int` | `8` | Number of mask tokens to insert during expansion. |
 | `max_gen_length` | `int` | `2048` | Maximum allowed generation length. |
 

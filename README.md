@@ -64,6 +64,7 @@ The corresponding usages can be found [here](./docs/decoding_strategies.md).
 
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|
+| Auto-regressive | - | - |
 | Vanilla / Semi-AR | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
 | Parallel | <a href="https://arxiv.org/abs/2505.22618"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2505.22618-58C9ED"> </a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
 | PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.13021-red"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/github/stars/NEUIR/PC-Sampler?style=social&label=Stars"></a> |

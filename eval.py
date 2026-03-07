@@ -12,6 +12,7 @@ from hydra.core.hydra_config import HydraConfig
 from loguru import logger
 from lm_eval.evaluator import simple_evaluate
 from lm_eval.tasks import TaskManager
+from pprint import pformat
 
 from src.utils import pre_initialize, Timer, sympy_antlr_patcher, load_eval_model
 
@@ -77,24 +78,20 @@ def main(cfg: DictConfig) -> None:
 
     if model.accelerator.is_main_process:
         results = results or {}
-        if model.tps is not None and model.throughput is not None:
+        metrics = dict(model.metrics)
+        if metrics.get("tps") is not None and metrics.get("throughput") is not None:
+            metrics["peak_memory_allocated_GB"] = peak_memory_allocated
+            logger.info(pformat(results["results"]))
             logger.info(
-                f"Throughput: {model.throughput:.2f} tokens/sec, "
-                f"Tokens per step: {model.tps:.2f} tokens/step "
-                f"(full: {model.full_throughput:.2f} tokens/sec, {model.full_tps:.2f} tokens/step), "
-                f"Latency: {model.latency:.2f} s, "
-                f"Total time: {model.total_time:.2f} s, "
-                f"Avg input length: {model.input_length:.2f} tokens, "
+                f"Throughput: {metrics['throughput']:.2f} tokens/sec, "
+                f"Tokens per step: {metrics['tps']:.2f} tokens/step "
+                f"(full: {metrics['full_throughput']:.2f} tokens/sec, {metrics['full_tps']:.2f} tokens/step), "
+                f"Latency: {metrics['latency']:.2f} s, "
+                f"Total time: {metrics['total_time']:.2f} s, "
+                f"Avg input length: {metrics['input_length']:.2f} tokens, "
                 f"Peak memory allocated: {peak_memory_allocated:.2f} GB"
             )
-            results["tps"] = model.tps
-            results["throughput"] = model.throughput
-            results["total_time"] = model.total_time
-            results["full_tps"] = model.full_tps
-            results["full_throughput"] = model.full_throughput
-            results["latency"] = model.latency
-            results["input_length"] = model.input_length
-            results["peak_memory_allocated_GB"] = peak_memory_allocated
+            results.update(metrics)
 
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2, default=serializer)
