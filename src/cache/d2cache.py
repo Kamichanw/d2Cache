@@ -4,7 +4,12 @@ import torch.nn.functional as F
 from contextlib import contextmanager
 
 from src.frame import Frame, FrameDelta
-from src.utils import certainty_density, nucleus_select, top_up_mask_
+from src.utils import (
+    certainty_density,
+    nucleus_select,
+    top_up_mask_,
+    is_adapted_from_ar,
+)
 from src.cache.base import dCache, AttentionContext
 
 
@@ -228,7 +233,7 @@ class d2Cache(dCache):
             & remaining_mask
         )
         # if model is dream, we need to retain the token before masked tokens
-        if self.model_config.model_type.lower() == "dream":
+        if is_adapted_from_ar(self.model_config):
             response_mask = F.pad(selected_mask[:, 1:], (0, 1), value=False)
         else:
             response_mask = selected_mask
@@ -253,7 +258,7 @@ class d2Cache(dCache):
         global_importance = self._attn_rollout.sum(dim=1)
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
 
-        if self.model_config.model_type.lower() == "dream":
+        if is_adapted_from_ar(self.model_config):
             # if the first mask token is selected, we need to select the token before it
             # i.e., the last prompt token
             q_mask[:, P - 1] = selected_mask[:, 0]  # type: ignore

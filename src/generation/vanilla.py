@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.distributions as dists
-from typing import Type
+from typing import Any, Callable, Type
 
 from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
@@ -10,8 +10,145 @@ from src.generation.utils import (
     check_can_generate,
     prepare_logits_for_generation,
     sample_tokens,
+    register,
 )
-from src.utils import certainty_density, register
+from src.utils import certainty_density, is_adapted_from_ar
+
+
+@torch.no_grad()
+def generate_step(
+    model,
+    frame: Frame,
+    block_mask: torch.Tensor,
+    num_transfer_tokens: torch.Tensor | int,
+    unmasking_fn: Callable,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values: dCache | None = None,
+    alg: str = "maskgit_plus",
+    temperature: float = 0.0,
+    top_p: float | None = None,
+    top_k: float | None = None,
+    mask_token_id: int = None,  # type: ignore
+    eos_token_id: int | None = None,
+    sigma: float | None = None,
+    stop_until_eos: bool = False,
+    debias: bool = False,
+    clip_alpha: float | None = None,
+    output_hidden_states: bool = False,
+    output_probs: bool = False,
+) -> FrameDelta | None:
+    frame = frame.as_batch()
+    batch_size, prompt_length = frame.prompts.shape
+    device = block_mask.device
+
+    if isinstance(num_transfer_tokens, torch.Tensor):
+        if num_transfer_tokens.numel() != batch_size or num_transfer_tokens.dim() != 1:
+            raise ValueError(
+                f"`num_transfer_tokens` must be a tensor of shape ({batch_size},) or a single integer, "
+                f"but got shape of {num_transfer_tokens.shape}."
+            )
+    else:
+        num_transfer_tokens = torch.full(
+            (batch_size,), num_transfer_tokens, device=device, dtype=torch.long
+        )
+
+    can_generate = check_can_generate(
+        frame,
+        eligible_mask=block_mask,
+        num_transfer_tokens=num_transfer_tokens,
+        stop_until_eos=stop_until_eos,
+        mask_token_id=mask_token_id,
+        eos_token_id=eos_token_id,
+    )
+    if not torch.any(can_generate):
+        return None
+    active_seq_idx = torch.nonzero(can_generate, as_tuple=True)[0]
+
+    remaining_mask = frame.generated_tokens == mask_token_id
+    transfer_index_mask = remaining_mask.clone()
+
+    if past_key_values is not None:
+        past_key_values.active_seq_mask = can_generate
+
+    x = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)[active_seq_idx]
+    attention_mask = (
+        attention_mask[active_seq_idx] if attention_mask is not None else None
+    )
+    block_mask = block_mask[active_seq_idx]
+    num_transfer_tokens = num_transfer_tokens[active_seq_idx]
+    outputs = model(
+        x,
+        attention_mask=attention_mask,
+        output_hidden_states=output_hidden_states,
+        past_key_values=past_key_values,
+        use_cache=past_key_values is not None,
+    )
+
+    logits = prepare_logits_for_generation(model, outputs.logits)
+    if past_key_values is not None and past_key_values.active_q_mask is not None:
+        if is_adapted_from_ar(model):
+            valid_mask = past_key_values.active_q_mask[:, prompt_length - 1 : -1]
+        else:
+            valid_mask = past_key_values.active_q_mask[:, prompt_length:]
+        transfer_index_mask[active_seq_idx].logical_and_(valid_mask)
+    logits = logits[:, prompt_length:]
+    transfer_index_mask = transfer_index_mask[active_seq_idx]
+    remaining_mask = remaining_mask[active_seq_idx]
+
+    hidden_states = (
+        tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
+        if output_hidden_states
+        else None
+    )
+
+    # sampling tokens for all generated positions
+    confidence, x0, p = sample_tokens(
+        logits,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        debias=debias,
+        clip_alpha=clip_alpha,
+        alg=alg,
+    )
+    scores = confidence = torch.where(transfer_index_mask, confidence, -torch.inf)
+    if sigma is not None and sigma > 0:
+        scores = confidence * certainty_density(~remaining_mask, sigma=sigma)
+
+    # delegate token selection to strategy-specific unmasking logic
+    transfer_index, extra = unmasking_fn(
+        active_seq_idx=active_seq_idx,
+        scores=scores,
+        probs=p,
+        transfer_index_mask=transfer_index_mask,
+        block_mask=block_mask,
+        num_transfer_tokens=num_transfer_tokens,
+    )
+    if len(transfer_index) != int(active_seq_idx.numel()):
+        raise ValueError(
+            "Transfer selector must return one index tensor per active sequence."
+        )
+
+    full_transfer_index = [
+        torch.tensor([], dtype=torch.long, device=device) for _ in range(batch_size)
+    ]
+    for seq_idx, index in zip(active_seq_idx.tolist(), transfer_index):
+        full_transfer_index[seq_idx] = index
+
+    return FrameDelta(
+        transfer_index=tuple(full_transfer_index),
+        decoded_tokens=torch.where(transfer_index_mask, x0, INVALID_TOKEN_ID),
+        confidence=confidence,
+        probs=(
+            torch.where(transfer_index_mask.unsqueeze(-1), p, -torch.inf)
+            if output_probs
+            else None
+        ),
+        intermediate=Intermediate(
+            hidden_states=hidden_states if hidden_states is not None else tuple()
+        ),
+        extra=extra,
+    )
 
 
 def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
@@ -19,12 +156,9 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
     In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
     Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
     the expected number of tokens transitioned at each step should be consistent.
-
     This function is designed to precompute the number of tokens that need to be transitioned at each step.
 
     Args:
-        mask_index: A boolean tensor of shape (B, L) indicating the positions of mask
-        steps: The number of steps in a block to sample.
 
     Returns:
         A tensor of shape (B, steps) indicating the number of tokens to be transferred at each step.
@@ -169,167 +303,7 @@ def confidence_unmasking(
     return tuple(transfer_index)
 
 
-@torch.no_grad()
-def generate_step(
-    model,
-    frame: Frame,
-    block_mask: torch.Tensor,
-    num_transfer_tokens: torch.Tensor | int,
-    attention_mask: torch.Tensor | None = None,
-    past_key_values: dCache | None = None,
-    alg: str = "maskgit_plus",
-    temperature: float = 0.0,
-    top_p: float | None = None,
-    top_k: float | None = None,
-    mask_token_id: int = None,  # type: ignore
-    eot_token_id: int | None = None,
-    sigma: float | None = None,
-    stop_until_eot: bool = False,
-    # EB sampler
-    gamma: float | None = None,
-    # PC sampler
-    debias: bool = False,
-    clip_alpha: float | None = None,
-    # parallel decoding
-    threshold: float | None = None,
-    factor: float | None = None,
-    output_hidden_states: bool = False,
-    output_probs: bool = False,
-) -> FrameDelta | None:
-    """
-    Generate a single step from a given frame. If all mask tokens have been filled, return None.
-    For `num_transfer_tokens`, a generation step selects a fixed number of tokens to transfer.
-    For `threshold`, a generation step selects all tokens whose confidence is above the threshold.
-
-    Args:
-        model: Mask predictor.
-        frame: The current frame containing the prompt and generated tokens.
-        block_mask: A mask of shape [B, gen_length] indicating which block of tokens are being processed.
-        num_transfer_tokens: The number of tokens to transfer at this step. It can be a tensor with shape (batch_size,) or
-            a single integer that represents the number of tokens to transfer for all batches.
-        temperature: Categorical distribution sampling temperature.
-        threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
-        factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
-        output_hidden_states: Whether to return the hidden states of all decoded tokens.
-        output_probs: Whether to return the probabilities of the decoded tokens.
-    """
-    frame = frame.as_batch()
-    batch_size, prompt_length = frame.prompts.shape
-    device = block_mask.device
-
-    if isinstance(num_transfer_tokens, torch.Tensor):
-        if num_transfer_tokens.numel() != batch_size or num_transfer_tokens.dim() != 1:
-            raise ValueError(
-                f"`num_transfer_tokens` must be a tensor of shape ({batch_size},) or a single integer, "
-                f"but got shape of {num_transfer_tokens.shape}."
-            )
-    else:
-        num_transfer_tokens = torch.full(
-            (batch_size,), num_transfer_tokens, device=device, dtype=torch.long
-        )
-
-
-    can_generate = check_can_generate(
-        frame,
-        eligible_mask=block_mask,
-        num_transfer_tokens=num_transfer_tokens,
-        stop_until_eot=stop_until_eot,
-        mask_token_id=mask_token_id,
-        eot_token_id=eot_token_id,
-    )
-    if not torch.any(can_generate):
-        return None
-    
-    remaining_mask = frame.generated_tokens == mask_token_id
-    transfer_index_mask = remaining_mask.clone()
-
-    if past_key_values is not None:
-        past_key_values.active_seq_mask = can_generate
-
-    x = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)[can_generate]
-    attention_mask = (
-        attention_mask[can_generate] if attention_mask is not None else None
-    )
-    num_transfer_tokens = num_transfer_tokens[can_generate]
-    outputs = model(
-        x,
-        attention_mask=attention_mask,
-        output_hidden_states=output_hidden_states,
-        past_key_values=past_key_values,
-        use_cache=past_key_values is not None,
-    )
-
-    logits = prepare_logits_for_generation(model, outputs.logits)
-    if past_key_values is not None and past_key_values.active_q_mask is not None:
-        if model.config.model_type.lower() == "dream":
-            valid_mask = past_key_values.active_q_mask[:, prompt_length - 1 : -1]
-        else:
-            valid_mask = past_key_values.active_q_mask[:, prompt_length:]
-        transfer_index_mask[can_generate].logical_and_(valid_mask)
-    logits = logits[:, prompt_length:]
-
-    hidden_states = (
-        tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
-        if output_hidden_states
-        else None
-    )
-
-    # sampling tokens for all generated positions
-    confidence, x0, p = sample_tokens(
-        logits,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        debias=debias,
-        clip_alpha=clip_alpha,
-        alg=alg,
-    )
-    scores = confidence = torch.where(
-        transfer_index_mask[can_generate], confidence, -torch.inf
-    )
-    if sigma is not None and sigma > 0:
-        scores = confidence * certainty_density(
-            ~remaining_mask[can_generate], sigma=sigma
-        )
-
-    # select tokens to transfer based on probs and mask
-    transfer_index = confidence_unmasking(
-        scores=scores,
-        transfer_index_mask=(transfer_index_mask & block_mask)[can_generate],
-        min_transfer_tokens=num_transfer_tokens,
-        threshold=threshold,
-        factor=factor,
-        gamma=gamma,
-        p=p,
-    )
-    transfer_index_iter = iter(transfer_index)
-    transfer_index = tuple(
-        (
-            next(transfer_index_iter)
-            if is_not_finished
-            else torch.tensor([], dtype=torch.long, device=device)
-        )
-        for is_not_finished in can_generate
-    )
-
-    return FrameDelta(
-        transfer_index=transfer_index,
-        decoded_tokens=torch.where(
-            transfer_index_mask[can_generate], x0, INVALID_TOKEN_ID
-        ),
-        confidence=confidence,
-        probs=(
-            torch.where(transfer_index_mask[can_generate].unsqueeze(-1), p, -torch.inf)
-            if output_probs
-            else None
-        ),
-        intermediate=Intermediate(
-            hidden_states=hidden_states if hidden_states is not None else tuple()
-        ),
-    )
-
-
-@register.gen_strategy("vanilla")
+@register("vanilla")
 def vanilla_generate(
     model,
     input_ids: torch.Tensor,
@@ -344,8 +318,8 @@ def vanilla_generate(
     sigma: float | None = None,
     mask_token_id: int | None = None,
     pad_token_id: int | None = None,
-    eot_token_id: int | None = None,
-    stop_until_eot: bool = False,
+    eos_token_id: int | None = None,
+    stop_until_eos: bool = False,
     # EB sampler
     gamma: float | None = None,
     # PC sampler
@@ -369,7 +343,7 @@ def vanilla_generate(
         temperature: Categorical distribution sampling temperature.
         mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
         pad_token_id: The token id of [PAD].
-        eot_token_id: The token id of [EOS]. It must be provided if stop_until_eot is set.
+        eos_token_id: The token id of [EOS]. It must be provided if stop_until_eos is set.
         top_k: The number of highest probability tokens to keep for one generation step.
         top_p: The cumulative probability threshold for nucleus sampling.
         sigma: The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
@@ -384,18 +358,18 @@ def vanilla_generate(
             "mask_token_id must be provided either as an argument or an environment variable."
         )
     mask_token_id = mask_token_id or int(os.environ.get("MASK_TOKEN_ID"))  # type: ignore
-    if stop_until_eot:
-        if eot_token_id is None and os.environ.get("EOT_TOKEN_ID", None) is None:
+    if stop_until_eos:
+        if eos_token_id is None and os.environ.get("EOS_TOKEN_ID", None) is None:
             raise ValueError(
-                "eot_token_id must be provided either as an argument or an environment variable if stop_until_eot is set to True."
+                "eos_token_id must be provided either as an argument or an environment variable if stop_until_eos is set to True."
             )
-        eot_token_id = eot_token_id or int(os.environ.get("EOT_TOKEN_ID"))  # type: ignore
+        eos_token_id = eos_token_id or int(os.environ.get("EOS_TOKEN_ID"))  # type: ignore
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
 
     assert steps % num_blocks == 0
-    steps = steps // num_blocks
+    steps_per_block = steps // num_blocks
 
     initial_frame = Frame.create_initial_frame(
         input_ids,
@@ -414,6 +388,28 @@ def vanilla_generate(
     cache = cache_cls(model.config) if cache_cls is not None else None
     frame = initial_frame
 
+    def unmasking_fn(
+        active_seq_idx: torch.Tensor,
+        scores: torch.Tensor,
+        probs: torch.Tensor,
+        transfer_index_mask: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_transfer_tokens: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]]:
+        return (
+            # select tokens to transfer based on probs and mask
+            confidence_unmasking(
+                scores=scores,
+                transfer_index_mask=transfer_index_mask & block_mask,
+                min_transfer_tokens=num_transfer_tokens,
+                threshold=threshold,
+                factor=factor,
+                gamma=gamma,
+                p=probs,
+            ),
+            {},
+        )
+
     deltas = []
 
     for block_idx in range(num_blocks):
@@ -427,19 +423,20 @@ def vanilla_generate(
             block_idx * block_length : (block_idx + 1) * block_length,
         ] = True
 
-        num_transfer_tokens = get_num_transfer_tokens(block_mask, steps)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask, steps_per_block)
         start_frame = frame.clone()
         if cache is not None:
             cache.on_block_start(block_mask, frame)
         block_deltas = []
-        for i in range(steps):
+        for step_idx in range(steps_per_block):
             if cache is not None:
                 cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
                 block_mask=block_mask,
-                num_transfer_tokens=num_transfer_tokens[:, i],
+                num_transfer_tokens=num_transfer_tokens[:, step_idx],
+                unmasking_fn=unmasking_fn,
                 attention_mask=attention_mask,
                 past_key_values=cache,
                 alg=alg,
@@ -447,14 +444,11 @@ def vanilla_generate(
                 top_p=top_p,
                 top_k=top_k,
                 sigma=sigma,
-                gamma=gamma,
                 mask_token_id=mask_token_id,
-                eot_token_id=eot_token_id,
-                stop_until_eot=stop_until_eot,
+                eos_token_id=eos_token_id,
+                stop_until_eos=stop_until_eos,
                 debias=debias,
                 clip_alpha=clip_alpha,
-                threshold=threshold,
-                factor=factor,
                 output_hidden_states=output_hidden_states,
                 output_probs=output_probs,
             )

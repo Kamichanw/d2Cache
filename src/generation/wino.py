@@ -6,10 +6,11 @@ from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Interme
 from src.generation.utils import (
     check_can_generate,
     prepare_logits_for_generation,
+    register,
     sample_tokens,
 )
 from src.generation.vanilla import confidence_unmasking
-from src.utils import certainty_density, register
+from src.utils import certainty_density
 
 
 @torch.no_grad()
@@ -23,9 +24,9 @@ def wino_generate_step(
     top_p: float | None = None,
     top_k: float | None = None,
     mask_token_id: int = None,  # type: ignore
-    eot_token_id: int | None = None,
+    eos_token_id: int | None = None,
     sigma: float | None = None,
-    stop_until_eot: bool = False,
+    stop_until_eos: bool = False,
     # PC sampler
     debias: bool = False,
     clip_alpha: float | None = None,
@@ -48,9 +49,9 @@ def wino_generate_step(
         frame,
         eligible_mask=block_mask,
         num_transfer_tokens=1,
-        stop_until_eot=stop_until_eot,
+        stop_until_eos=stop_until_eos,
         mask_token_id=mask_token_id,
-        eot_token_id=eot_token_id,
+        eos_token_id=eos_token_id,
     )
 
     if not torch.any(can_generate):
@@ -273,7 +274,7 @@ def wino_generate_step(
     ).to(model.dtype)
 
 
-@register.gen_strategy("wino")
+@register("wino")
 def wino_generate(
     model,
     input_ids: torch.Tensor,
@@ -287,8 +288,8 @@ def wino_generate(
     sigma: float | None = None,
     mask_token_id: int | None = None,
     pad_token_id: int | None = None,
-    eot_token_id: int | None = None,
-    stop_until_eot: bool = False,
+    eos_token_id: int | None = None,
+    stop_until_eos: bool = False,
     # wino
     wide_in_thres: float = 0.6,
     narrow_out_thres: float = 0.9,
@@ -305,12 +306,12 @@ def wino_generate(
         raise ValueError(
             "mask_token_id and pad_token_id must be provided either as arguments or environment variables."
         )
-    if stop_until_eot:
-        if eot_token_id is None and os.environ.get("EOT_TOKEN_ID", None) is None:
+    if stop_until_eos:
+        if eos_token_id is None and os.environ.get("EOS_TOKEN_ID", None) is None:
             raise ValueError(
-                "eot_token_id must be provided either as an argument or an environment variable if stop_until_eot is set to True."
+                "eos_token_id must be provided either as an argument or an environment variable if stop_until_eos is set to True."
             )
-        eot_token_id = eot_token_id or int(os.environ.get("EOT_TOKEN_ID"))  # type: ignore
+        eos_token_id = eos_token_id or int(os.environ.get("EOS_TOKEN_ID"))  # type: ignore
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -357,8 +358,8 @@ def wino_generate(
                 top_p=top_p,
                 top_k=top_k,
                 sigma=sigma,
-                eot_token_id=eot_token_id,
-                stop_until_eot=stop_until_eot,
+                eos_token_id=eos_token_id,
+                stop_until_eos=stop_until_eos,
                 mask_token_id=mask_token_id,
                 wide_in_thres=wide_in_thres,
                 narrow_out_thres=narrow_out_thres,

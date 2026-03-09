@@ -4,6 +4,5 @@ defaults:
 
 strategy: klass
 
-
 kl_threshold: 0.01
 kl_history_length: 2

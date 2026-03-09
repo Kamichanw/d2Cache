@@ -14,21 +14,21 @@ if TYPE_CHECKING:
 
 class Registry:
     def __init__(self):
-        self._gen_strategy = {}
+        self._registry = {}
 
-    def gen_strategy(self, strategy: str, alias: list[str] | None = None):
+    def __call__(self, key: str, alias: list[str] | None = None):
         def decorator(obj):
             if not callable(obj):
                 raise TypeError(f"{obj} is not callable")
-            self._gen_strategy[strategy] = obj
+            self._registry[key] = obj
             for a in alias or []:
-                self._gen_strategy[a] = obj
+                self._registry[a] = obj
             return obj
 
         return decorator
 
     def get(self, key: str):
-        ret = self._gen_strategy.get(key)
+        ret = self._registry.get(key)
         if ret is None:
             raise ValueError(f"Unknown key: {key}")
         return ret
@@ -45,12 +45,9 @@ class Registry:
                 except ImportError:
                     pass
 
-    @property
-    def all_gen_strategies(self):
-        return list(self._gen_strategy.keys())
+    def keys(self):
+        return list(self._registry.keys())
 
-
-register = Registry()
 
 
 class Timer:
@@ -108,18 +105,18 @@ class Timer:
     def cumulative_ms(self) -> float:
         return self.cumulative_s * 1000
 
-    def token_per_second(self, record: "DecodeRecord", until_eot: bool = True) -> float:
+    def token_per_second(self, record: "DecodeRecord", until_eos: bool = True) -> float:
         """
         Calculate the number of tokens processed per second.
         """
         if not hasattr(self, "elapsed_time_s"):
             raise RuntimeError("Timer has not been started or stopped.")
-        eot_token_id = int(
-            os.environ.get("EOT_TOKEN_ID", "126081")
+        eos_token_id = int(
+            os.environ.get("EOS_TOKEN_ID", "126081")
         )  # 126081 for llada, 151643 for dream
-        if until_eot:
+        if until_eos:
             final_token_seqs = record[-1].generated_tokens
-            num_tokens = (final_token_seqs == eot_token_id).int().argmax()
+            num_tokens = (final_token_seqs == eos_token_id).int().argmax()
             num_tokens = torch.where(
                 num_tokens > 0, num_tokens, final_token_seqs.size(-1)
             )
@@ -135,23 +132,23 @@ class Timer:
             ]
             return sum(total_tokens) / self.elapsed_time_s
 
-    def token_per_step(self, record: "DecodeRecord", until_eot: bool = True) -> float:
+    def token_per_step(self, record: "DecodeRecord", until_eos: bool = True) -> float:
         """
         Calculate the number of tokens processed per step.
         """
-        if until_eot:
-            eot_token_id = int(
-                os.environ["EOT_TOKEN_ID"]  # 126081 for llada, 151643 for dream
+        if until_eos:
+            eos_token_id = int(
+                os.environ["EOS_TOKEN_ID"]  # 126081 for llada, 151643 for dream
             )
             final_token_seqs = record[-1].generated_tokens
-            num_tokens = (final_token_seqs == eot_token_id).int().argmax(keepdim=True)
+            num_tokens = (final_token_seqs == eos_token_id).int().argmax(keepdim=True)
             num_tokens = torch.where(
                 num_tokens > 0, num_tokens, final_token_seqs.size(-1)
             )
             total_steps = 0
-            for batch_idx, eot_idx in enumerate(num_tokens):
+            for batch_idx, eos_idx in enumerate(num_tokens):
                 # add 1, since steps are 0-indexed
-                total_steps += record[-1].steps[batch_idx, :eot_idx].max().item() + 1
+                total_steps += record[-1].steps[batch_idx, :eos_idx].max().item() + 1
             return torch.sum(num_tokens).item() / total_steps
         else:
             total_tokens = 0

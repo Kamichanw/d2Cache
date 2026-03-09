@@ -1,16 +1,14 @@
 # An example to evaluate parallel decoding on LLaDA-8B-Instruct/HumanEval
 # More methods please refer to docs
-
+export HF_HOME=/mnt/local/tmpp/.cache/huggingface
+export CUDA_VISIBLE_DEVICES=7
 accelerate launch \
     --num_machines 1 \
-    --num_processes 4 \
+    --num_processes 1 \
     eval.py \
     dataset.name=humaneval \
+    dataset.size=10 \
     batch_size=1 \
     seed=1234 \
     generation=vanilla \
-    generation.steps=512 \
-    generation.gen_length=512 \
-    generation.block_length=32 \
-    generation.threshold=0.9 \
     model=llada-inst 

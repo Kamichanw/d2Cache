@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from contextlib import contextmanager
 
 from src.frame import Frame, FrameDelta
 from src.cache.base import dCache, AttentionContext
+from src.utils import is_adapted_from_ar
 
 
 class PrefixCache(dCache):
@@ -111,7 +113,7 @@ class PrefixCache(dCache):
                 block_start = int(block_mask[0].int().argmax() + 1)
                 q_mask[:, frame.prompts.size(-1) + block_start :] = True
 
-            if self.model_config.model_type.lower() == "dream":
+            if is_adapted_from_ar(self.model_config):
                 q_mask = F.pad(q_mask[:, 1:], (0, 1), value=False)
 
             self.active_q_mask = q_mask

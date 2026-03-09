@@ -43,7 +43,7 @@ _target_: src.cache.MyCache
 The framework supports modular decoding strategies, allowing researchers to implement custom generation algorithms (e.g., autoregressive, non-autoregressive, or iterative refinement) without modifying the core model code.
 
 ### Registration Mechanism
-New strategies are registered using the `@register.gen_strategy` decorator. This allows the strategy to be selected via the configuration file or command-line arguments using its registered name.
+New strategies are registered using the `@register` decorator. This allows the strategy to be selected via the configuration file or command-line arguments using its registered name.
 
 
 ### Implementation Workflow
@@ -70,7 +70,7 @@ A decoding strategy is implemented as a function that accepts the model, input i
 ### Example Structure
 
 ```python
-@register.gen_strategy("iterative_refinement")
+@register("iterative_refinement")
 def iterative_refinement_generate(model, input_ids, steps=5, ...):
     # 1. Initialize
     frame = Frame.create_initial_frame(input_ids, ...)
@@ -92,7 +92,7 @@ def iterative_refinement_generate(model, input_ids, steps=5, ...):
 ### Configuration
 To use your custom strategy, create a new YAML configuration file in `configs/generation/` (e.g., `configs/generation/my_strategy.yaml`).
 ```yaml
-name: my_strategy  # Matches the name used in @register.gen_strategy
+name: my_strategy  # Matches the name used in @register
 steps: 10
 # ... other parameters passed to the function
 ```

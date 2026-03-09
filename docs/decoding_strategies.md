@@ -148,48 +148,6 @@ accelerate launch \
 ```
 
 
-## Beyond Fixed: Training-Free Variable-Length Denoising for Diffusion Large Language Models
-Jinsong Li, Xiaoyi Dong, Yuhang Zang, Yuhang Cao, Jiaqi Wang, Dahua Lin
-
-<details>
-<summary><strong>Abstract</strong></summary>
-
-Diffusion Large Language Models (DLLMs) are emerging as a powerful alternative to the dominant Autoregressive Large Language Models, offering efficient parallel generation and capable global context modeling. However, the practical application of DLLMs is hindered by a critical architectural constraint: the need for a statically predefined generation length. This static length allocation leads to a problematic trade-off: insufficient lengths cripple performance on complex tasks, while excessive lengths incur significant computational overhead and sometimes result in performance degradation. While the inference framework is rigid, we observe that the model itself possesses internal signals that correlate with the optimal response length for a given task. To bridge this gap, we leverage these latent signals and introduce DAEDAL, a novel training-free denoising strategy that enables Dynamic Adaptive Length Expansion for Diffusion Large Language Models. DAEDAL operates in two phases: 1) Before the denoising process, DAEDAL starts from a short initial length and iteratively expands it to a coarse task-appropriate length, guided by a sequence completion metric. 2) During the denoising process, DAEDAL dynamically intervenes by pinpointing and expanding insufficient generation regions through mask token insertion, ensuring the final output is fully developed. Extensive experiments on DLLMs demonstrate that DAEDAL achieves performance comparable, and in some cases superior, to meticulously tuned fixed-length baselines, while simultaneously enhancing computational efficiency by achieving a higher effective token ratio. By resolving the static length constraint, DAEDAL unlocks new potential for DLLMs, bridging a critical gap with their Autoregressive counterparts and paving the way for more efficient and capable generation.
-
-</details>
-
-### Hyper-parameters
-
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `initial_gen_length` | `int` | `64` | Initial generation length. |
-| `initial_eot_expand_thres` | `float` | `0.5` | Threshold for initial length expansion (Stage 1). |
-| `decode_eot_expand_thres` | `float` | `0.9` | Threshold for dynamic length expansion (Stage 2). |
-| `low_conf_expand_thres` | `float` | `0.1` | Confidence threshold for selecting expansion points. |
-| `num_check_last_eot` | `int` | `32` | Number of last tokens to check for EOT confidence. |
-| `expansion_factor` | `int` | `8` | Number of mask tokens to insert during expansion. |
-| `max_gen_length` | `int` | `2048` | Maximum allowed generation length. |
-
-### Example Usage
-
-```bash
-# Test DAEDAL decoding on GSM8K with LLaDA-7B-Instruct, run:
-accelerate launch \
-    --num_machines 1 \
-    --num_processes 4 \
-    eval.py \
-    dataset.name=humaneval_instruct \
-    batch_size=8 \
-    seed=1234 \
-    generation=daedal \
-    generation.initial_gen_length=128 \
-    model=llada-inst 
-```
-
-> [!NOTE]
-> DAEDAL is not compatible to all current KV cache methods.
-
-
 ## KLASS: KL-Guided Fast Inference in Masked Diffusion Models
 Seo Hyun Kim, Sunwoo Hong, Hojung Jung, Youngrok Park, Se-Young Yun
 
