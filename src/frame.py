@@ -1,7 +1,7 @@
 import os
 import torch
 
-from typing import overload
+from typing import cast, overload
 from pydantic import BaseModel, Field, model_validator
 from collections.abc import Sequence
 from functools import cached_property
@@ -130,55 +130,89 @@ class Intermediate(Base):
 
 class FrameDelta(Base):
     """
-    A delta of a Frame object, tracking the changes made to the first frame during the decoding process.
-    If any sequence has finished, the corresponding `transfer_index` will be an empty tensor, and other
-    tensors will be shape of `[batch_size - num_finished_sequences, ...]`.
+    A delta of a `Frame`, tracking the changes made at one decoding step.
+
+    A `FrameDelta` can describe either a single sequence or a batch:
+    - single-sequence delta: `decoded_tokens` has shape `(gen_length,)`, `delete_index`
+      has shape `(num_deletions,)`, and other index tensors are 1D as well.
+    - batched delta: `transfer_index` is a tuple with one 1D tensor per sequence,
+      `decoded_tokens` has shape `(num_active_sequences, gen_length)`, and index
+      tensors such as `delete_index` have shape `(num_active_sequences, num_deletions)`.
+
+    If any batched sequence has finished, the corresponding `transfer_index` is an empty
+    tensor, while tensors stored per active sequence only keep rows for unfinished
+    sequences.
     """
 
     class Config:
         arbitrary_types_allowed = True
 
     transfer_index: torch.Tensor | tuple[torch.Tensor, ...] = Field(
-        description="The indices of the transferred tokens within the decoded_tokens.",
+        description=(
+            "The target positions of transferred tokens. Use a 1D tensor for a single "
+            "sequence, or a tuple of 1D tensors for batched decoding."
+        ),
     )
     transfer_src_index: torch.Tensor | tuple[torch.Tensor, ...] | None = Field(
         default=None,
         description=(
-            "The indices of the source tokens within the decoded_tokens."
-            " If it is None, transfer tokens at indices specified by `transfer_index`."
+            "The source positions of transferred tokens within `decoded_tokens`. Use the "
+            "same single-sequence or batched layout as `transfer_index`. If it is `None`, "
+            "transfer tokens at indices specified by `transfer_index`."
         ),
     )
     insert_index: torch.Tensor | None = Field(
         default=None,
-        description="The target indices to insert in the transferred generated tokens.",
+        description=(
+            "The target insertion positions. Use shape `(num_insertions,)` for a single "
+            "sequence or `(num_active_sequences, num_insertions)` for batched decoding."
+        ),
     )
     insert_src_index: torch.Tensor | None = Field(
         default=None,
         description=(
-            "The source indices of inserted tokens within the decoded_tokens."
-            " It can't be None if `insert_index` is specified."
+            "The source positions of inserted tokens within `decoded_tokens`. Its shape "
+            "must match `insert_index`, and it cannot be `None` when `insert_index` is "
+            "specified."
         ),
     )
     delete_index: torch.Tensor | None = Field(
         default=None,
-        description="The indices of deleted tokens in the inserted decoded_tokens",
+        description=(
+            "The positions to delete after insertion. Use shape `(num_deletions,)` for a "
+            "single sequence or `(num_active_sequences, num_deletions)` for batched decoding."
+        ),
     )
     decoded_tokens: torch.Tensor = Field(
         description=(
-            "The decoded tokens in each sequence with shape [batch_size, gen_length]. It can be expanded to "
-            "a large size compared to previous step, but deletion should only be specified by `delete_index`."
+            "The decoded tokens produced at this step. Use shape `(gen_length,)` for a "
+            "single sequence or `(num_active_sequences, gen_length)` for batched decoding. "
+            "It may temporarily grow compared to the previous step; deletions should be "
+            "described by `delete_index`."
         ),
     )
     confidence: torch.Tensor | None = Field(
-        default=None, description="The confidence scores for all decoded tokens."
+        default=None,
+        description=(
+            "Confidence scores aligned with `decoded_tokens`. Its shape must match "
+            "`decoded_tokens` in both single-sequence and batched cases."
+        ),
     )
     probs: torch.Tensor | None = Field(
         default=None,
-        description="The probability distributions of the decoded tokens over vocabulary.",
+        description=(
+            "The token probability distributions. Use shape `(gen_length, vocab_size)` for "
+            "a single sequence or `(num_active_sequences, gen_length, vocab_size)` for "
+            "batched decoding."
+        ),
     )
     intermediate: Intermediate = Field(
         default_factory=Intermediate,
-        description="The intermediate states (hidden/key/value/query) of tokens from layers.",
+        description=(
+            "The intermediate states of decoded tokens. Its tensors are unbatched when the "
+            "delta describes one sequence and batched when the delta describes multiple "
+            "active sequences."
+        ),
     )
     extra: dict = Field(
         default_factory=dict,
@@ -187,6 +221,22 @@ class FrameDelta(Base):
 
     @model_validator(mode="after")
     def check_shapes(self) -> "FrameDelta":
+        def check_transfer_tuple(
+            name: str,
+            value: tuple[torch.Tensor, ...] | None,
+            expected_len: int,
+        ) -> None:
+            if value is None:
+                return
+            if len(value) != expected_len:
+                raise ValueError(
+                    f"'{name}' must have the same length as 'transfer_index'."
+                )
+            if any(t.dim() != 1 for t in value):
+                raise ValueError(
+                    f"Each tensor in '{name}' must be 1D for a batched delta."
+                )
+
         if self.insert_index is not None and self.insert_src_index is None:
             raise ValueError(
                 "insert_src_index is required when insert_index is provided."
@@ -201,14 +251,45 @@ class FrameDelta(Base):
             )
 
         if self.is_batched:
+            transfer_src_index = cast(
+                tuple[torch.Tensor, ...] | None,
+                self.transfer_src_index,
+            )
             batch_size = len(self.transfer_index)
+            if any(t.dim() != 1 for t in self.transfer_index):
+                raise ValueError(
+                    "Each tensor in 'transfer_index' must be 1D for a batched delta."
+                )
+            check_transfer_tuple(
+                "transfer_src_index",
+                transfer_src_index,
+                batch_size,
+            )
+
             num_finished_sequences = sum(t.numel() == 0 for t in self.transfer_index)
             active_batch_size = batch_size - num_finished_sequences
 
+            if self.decoded_tokens.dim() != 2:
+                raise ValueError("decoded_tokens must be 2D for a batched delta.")
             if self.decoded_tokens.size(0) != active_batch_size:
                 raise ValueError(
                     f"decoded_tokens batch size ({self.decoded_tokens.size(0)}) must match active sequence count ({active_batch_size})."
                 )
+
+            if (
+                self.confidence is not None
+                and self.confidence.shape != self.decoded_tokens.shape
+            ):
+                raise ValueError(
+                    "confidence must have the same shape as decoded_tokens."
+                )
+            if self.probs is not None:
+                if self.probs.dim() != 3:
+                    raise ValueError("probs must be 3D for a batched delta.")
+                if self.probs.shape[:2] != self.decoded_tokens.shape:
+                    raise ValueError(
+                        "The first two dimensions of probs must match decoded_tokens."
+                    )
 
             index_fields = {
                 "insert_index": self.insert_index,
@@ -226,8 +307,44 @@ class FrameDelta(Base):
                             f"The first dimension of '{name}' ({field.size(0)}) must match active sequence count ({active_batch_size})."
                         )
         else:
+            transfer_index = cast(torch.Tensor, self.transfer_index)
+            transfer_src_index = cast(torch.Tensor | None, self.transfer_src_index)
+
+            if transfer_index.dim() != 1:
+                raise ValueError("transfer_index must be 1D for a non-batched delta.")
+            if transfer_src_index is not None:
+                if transfer_src_index.dim() != 1:
+                    raise ValueError(
+                        "transfer_src_index must be 1D for a non-batched delta."
+                    )
+                if transfer_src_index.shape != transfer_index.shape:
+                    raise ValueError(
+                        "transfer_src_index must have the same shape as transfer_index."
+                    )
+
+            if self.decoded_tokens.dim() != 1:
+                raise ValueError("decoded_tokens must be 1D for a non-batched delta.")
+            if (
+                self.confidence is not None
+                and self.confidence.shape != self.decoded_tokens.shape
+            ):
+                raise ValueError(
+                    "confidence must have the same shape as decoded_tokens."
+                )
+            if self.probs is not None:
+                if self.probs.dim() != 2:
+                    raise ValueError("probs must be 2D for a non-batched delta.")
+                if self.probs.size(0) != self.decoded_tokens.size(0):
+                    raise ValueError(
+                        "The first dimension of probs must match decoded_tokens."
+                    )
+
             if self.insert_index is not None and self.insert_index.dim() != 1:
                 raise ValueError("insert_index must be 1D for a non-batched delta.")
+            if self.insert_src_index is not None and self.insert_src_index.dim() != 1:
+                raise ValueError(
+                    "insert_src_index must be 1D for a non-batched delta."
+                )
             if self.delete_index is not None and self.delete_index.dim() != 1:
                 raise ValueError("delete_index must be 1D for a non-batched delta.")
         return self
@@ -235,6 +352,38 @@ class FrameDelta(Base):
     @property
     def is_batched(self) -> bool:
         return isinstance(self.transfer_index, tuple)
+
+    def as_batch(self) -> "FrameDelta":
+        if self.is_batched:
+            return self
+
+        transfer_index = cast(torch.Tensor, self.transfer_index)
+        transfer_src_index = cast(torch.Tensor | None, self.transfer_src_index)
+
+        return FrameDelta(
+            transfer_index=(transfer_index,),
+            transfer_src_index=(transfer_src_index,)
+            if transfer_src_index is not None
+            else None,
+            insert_index=(
+                self.insert_index.unsqueeze(0) if self.insert_index is not None else None
+            ),
+            insert_src_index=(
+                self.insert_src_index.unsqueeze(0)
+                if self.insert_src_index is not None
+                else None
+            ),
+            delete_index=(
+                self.delete_index.unsqueeze(0) if self.delete_index is not None else None
+            ),
+            decoded_tokens=self.decoded_tokens.unsqueeze(0),
+            confidence=(
+                self.confidence.unsqueeze(0) if self.confidence is not None else None
+            ),
+            probs=self.probs.unsqueeze(0) if self.probs is not None else None,
+            intermediate=self.intermediate.as_batch(),
+            extra=self.extra,
+        )
 
     @property
     def transferred_tokens(self) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -393,25 +542,49 @@ class FrameDelta(Base):
 
 class Frame(Base):
     """
-    A specific decoding step of LLaDA. It tracks the prompt, generated tokens, confidence scores, and steps when each token was decoded.
-    The shape of all tensors can be (batch_size, sequence_length) or (sequence_length,). Different sequences can generate different numbers of tokens
-    in one step.
+    A specific decoding step of LLaDA.
+
+    A `Frame` can store either a single sequence or a batch of sequences:
+    - single-sequence frame: `prompts`, `generated_tokens`, `confidence`, and `steps`
+      are 1D tensors.
+    - batched frame: the same members are 2D tensors with leading dimension
+      `batch_size`.
+
+    Different sequences can generate different numbers of tokens in one step, which is
+    recorded by the corresponding `FrameDelta`.
     """
 
     class Config:
         arbitrary_types_allowed = True
 
-    prompts: torch.Tensor = Field(frozen=True, description="The input prompt tensor.")
+    prompts: torch.Tensor = Field(
+        frozen=True,
+        description=(
+            "The prompt tokens. Use shape `(prompt_length,)` for a single sequence or "
+            "`(batch_size, prompt_length)` for batched decoding."
+        ),
+    )
     generated_tokens: torch.Tensor = Field(
         frozen=True,
-        description="The generated tokens, including mask tokens that have not been decoded yet.",
+        description=(
+            "The generated tokens, including mask tokens that have not been decoded yet. "
+            "Use shape `(gen_length,)` for a single sequence or `(batch_size, gen_length)` "
+            "for batched decoding."
+        ),
     )
     confidence: torch.Tensor | None = Field(
-        default=None, description="The confidence scores for all generated tokens."
+        default=None,
+        description=(
+            "Confidence scores aligned with `generated_tokens`. Its shape must match "
+            "`generated_tokens` in both single-sequence and batched cases."
+        ),
     )
     steps: torch.Tensor = Field(
         frozen=True,
-        description=f"The token at the corresponding position is decoded at which step. For mask token, step is {PLACEHOLDER_STEP}.",
+        description=(
+            "The decoding step of each token. Its shape matches `generated_tokens`. For "
+            f"mask tokens, the step value is {PLACEHOLDER_STEP}."
+        ),
     )
 
     @model_validator(mode="after")
@@ -447,22 +620,23 @@ class Frame(Base):
                 "mask_token_id must be provided either as an argument or an environment variable."
             )
         is_batched = prompts.dim() > 1
+        batched_prompts = prompts if is_batched else prompts.unsqueeze(0)
         frame = cls(
-            prompts=prompts.squeeze(0) if not is_batched else prompts,
+            prompts=batched_prompts,
             generated_tokens=torch.full(
-                (prompts.size(0), gen_length),
+                (batched_prompts.size(0), gen_length),
                 mask_token_id,
                 dtype=torch.long,
                 device=prompts.device,
             ),
             confidence=torch.full(
-                (prompts.size(0), gen_length),
+                (batched_prompts.size(0), gen_length),
                 -torch.inf,
                 dtype=torch.float32,
                 device=prompts.device,
             ),
             steps=torch.full(
-                (prompts.size(0), gen_length),
+                (batched_prompts.size(0), gen_length),
                 PLACEHOLDER_STEP,
                 dtype=torch.long,
                 device=prompts.device,
@@ -475,7 +649,8 @@ class Frame(Base):
         self, delta: FrameDelta, mask_token_id: int | None = None
     ) -> "Frame":
         """
-        Applies a delta to the current frame and returns a new frame.
+        Applies a single-sequence or batched delta to the current frame and returns a
+        new frame.
         """
 
         delta = delta.as_batch()
@@ -535,26 +710,26 @@ class Frame(Base):
                 raise RuntimeError(
                     "The insert index and insert source index must both be specified and have the same shape."
                 )
-            B, K = delta.insert_index.shape
+            _, K = delta.insert_index.shape
 
             # upsample delta data to full batch size
             expand_active_mask = active_mask.unsqueeze(1).expand(-1, K)
             full_insert_index = torch.zeros(
-                B, K, dtype=torch.long, device=device
+                batch_size, K, dtype=torch.long, device=device
             ).masked_scatter_(expand_active_mask, delta.insert_index)
             full_insert_tokens = torch.full(
-                (B, K), mask_token_id, dtype=torch.long, device=device
+                (batch_size, K), mask_token_id, dtype=torch.long, device=device
             ).masked_scatter_(expand_active_mask, delta.inserted_tokens)
             full_insert_steps = torch.full(
-                (B, K), PLACEHOLDER_STEP, dtype=torch.long, device=device
+                (batch_size, K), PLACEHOLDER_STEP, dtype=torch.long, device=device
             ).masked_scatter_(
                 expand_active_mask,
-                (self.current_steps[active_mask, None] + 1).expand(-1, K),  # type: ignore
+                (new_frame.current_steps[active_mask, None] + 1).expand(-1, K),  # type: ignore
             )
             full_insert_conf = None
             if delta.confidence is not None:
                 full_insert_conf = torch.zeros(
-                    B, K, dtype=delta.confidence.dtype, device=device
+                    batch_size, K, dtype=delta.confidence.dtype, device=device
                 ).masked_scatter_(
                     expand_active_mask,
                     torch.gather(delta.confidence, 1, delta.insert_src_index),

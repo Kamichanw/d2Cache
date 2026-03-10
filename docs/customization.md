@@ -61,7 +61,7 @@ A decoding strategy is implemented as a function that accepts the model, input i
 3.  **Iterative Generation Loop**: 
     Implement the core loop that drives the generation process. This typically involves:
     *   **Step Execution**: Calling `generate_step` (or a custom step function) to perform a forward pass and sample new tokens.
-    *   **Delta Application**: The step function returns a `FrameDelta`, which contains the changes (new tokens, confidence scores) to be applied to the frame.
+    *   **Delta Application**: The step function returns a `FrameDelta`, which contains the changes (new tokens, confidence scores) to be applied to the frame. Both `Frame` and `FrameDelta` may describe either a single sequence or a batch of sequences, so shape conventions should stay consistent with the current decoding mode.
     *   **State Update**: Apply the delta to the frame using `frame.apply_delta(delta)`.
 
 4.  **Result Compilation**: 
