@@ -1,0 +1,10 @@
+defaults:
+  - sdar-common
+  - _self_
+
+name: sdar-8b-chat
+path: ${oc.env:SDAR_8B_CHAT_PATH}
+
+# SDAR is a chat model; let lm-eval apply the chat template.
+apply_chat_template: true
+
