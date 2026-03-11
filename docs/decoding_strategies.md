@@ -12,7 +12,7 @@ The capabilities of large language models (LLMs) are widely regarded as relying 
 
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
-| `generation.steps` | `int` | Total number of denoising steps. |
+| `generation.num_transfer_tokens` | `int` | Minimum number of tokens transferred in each decoding step. |
 | `generation.gen_length` | `int` | The total length of the sequence to generate. |
 | `generation.block_length` | `int` | The size of the block for semi-autoregressive decoding. |
 
@@ -28,7 +28,7 @@ accelerate launch \
     batch_size=1 \
     seed=1234 \
     generation=vanilla \
-    generation.steps=256 \
+    generation.num_transfer_tokens=1 \
     generation.gen_length=256 \
     generation.block_length=32 \
     model=llada-inst 
@@ -64,7 +64,7 @@ accelerate launch \
     batch_size=1 \
     seed=1234 \
     generation=vanilla \
-    generation.steps=256 \
+    generation.num_transfer_tokens=1 \
     generation.gen_length=256 \
     generation.block_length=32 \
     generation.threshold=0.9 \
@@ -102,7 +102,7 @@ accelerate launch \
     batch_size=1 \
     seed=1234 \
     generation=pc_sampler \
-    generation.steps=256 \
+    generation.num_transfer_tokens=1 \
     generation.gen_length=256 \
     generation.block_length=32 \
     generation.debias=true \
@@ -141,7 +141,7 @@ accelerate launch \
     batch_size=1 \
     seed=1234 \
     generation=vanilla \
-    generation.steps=256 \
+    generation.num_transfer_tokens=1 \
     generation.gen_length=256 \
     generation.sigma=10 \
     model=llada-inst 

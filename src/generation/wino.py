@@ -19,6 +19,7 @@ def wino_generate_step(
     frame: Frame,
     block_mask: torch.Tensor,
     attention_mask: torch.Tensor,
+    num_transfer_tokens: int = 1,
     alg: str = "maskgit_plus",
     temperature: float = 0.0,
     top_p: float | None = None,
@@ -48,7 +49,7 @@ def wino_generate_step(
     can_generate = check_can_generate(
         frame,
         eligible_mask=block_mask,
-        num_transfer_tokens=1,
+        num_transfer_tokens=num_transfer_tokens,
         stop_until_eos=stop_until_eos,
         mask_token_id=mask_token_id,
         eos_token_id=eos_token_id,
@@ -56,7 +57,7 @@ def wino_generate_step(
 
     if not torch.any(can_generate):
         return None
-    
+
     remaining_mask = frame.generated_tokens == mask_token_id
     transfer_index_mask = remaining_mask.clone()
 
@@ -160,13 +161,19 @@ def wino_generate_step(
     selected_indices = confidence_unmasking(
         scores=scores,
         transfer_index_mask=block_mask_curr,
-        min_transfer_tokens=torch.ones(
-            active_batch_size, device=scores.device, dtype=torch.long
-        ),
-        max_transfer_tokens=torch.clamp(
-            (block_mask_curr.sum(dim=1) * 0.7).int(),
-            min=5,
-            max=20,  # adopted from the official implementation
+        min_transfer_tokens=num_transfer_tokens,
+        max_transfer_tokens=torch.maximum(
+            torch.clamp(
+                (block_mask_curr.sum(dim=1) * 0.7).int(),
+                min=5,
+                max=20,  # adopted from the official implementation
+            ),
+            torch.full(
+                (active_batch_size,),
+                num_transfer_tokens,
+                device=scores.device,
+                dtype=torch.long,
+            ),
         ),
         threshold=wide_in_thres,
     )
@@ -197,7 +204,7 @@ def wino_generate_step(
         row_conf = shadow_conf[i]
         row_remask = row_conf < narrow_out_thres
 
-        target_k = int(current_wide_in[i].item()) - 1
+        target_k = max(int(current_wide_in[i].item()) - num_transfer_tokens, 0)
 
         if row_remask.sum() > target_k:
             if target_k <= 0:
@@ -282,6 +289,7 @@ def wino_generate(
     alg: str = "maskgit_plus",
     block_length: int = 32,
     gen_length: int = 128,
+    num_transfer_tokens: int = 1,
     temperature: float = 0.0,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -315,6 +323,8 @@ def wino_generate(
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
+    if num_transfer_tokens <= 0:
+        raise ValueError(f"{num_transfer_tokens=} must be > 0")
 
     initial_frame = Frame.create_initial_frame(
         input_ids,
@@ -353,6 +363,7 @@ def wino_generate(
                 frame=frame,
                 block_mask=block_mask,
                 attention_mask=attention_mask,
+                num_transfer_tokens=num_transfer_tokens,
                 alg=alg,
                 temperature=temperature,
                 top_p=top_p,

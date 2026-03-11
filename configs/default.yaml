@@ -5,6 +5,7 @@ defaults:
     - _self_
 
 seed: 42
+gen_args_script: configs/gen_args.py
 batch_size: ${dataset.batch_size}
 attn_implementation: "sdpa" # sdpa or eager
 dataset:

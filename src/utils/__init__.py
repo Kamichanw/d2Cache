@@ -5,9 +5,11 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import hashlib
 import omegaconf
 import warnings
 from importlib.metadata import version
+from importlib.util import module_from_spec, spec_from_file_location
 
 from pathlib import Path
 from accelerate.utils import set_seed
@@ -19,6 +21,7 @@ from hydra import compose
 from hydra.utils import instantiate
 from hydra.core.hydra_config import HydraConfig
 from dill import PickleWarning
+from typing import Callable, cast
 
 from .models import *
 from .common import *
@@ -111,13 +114,46 @@ def get_config_diff(d1: dict, d2: dict) -> dict:
     return diff
 
 
+def load_generation_args(script_path: str | Path) -> Callable[..., dict]:
+    script_path = Path(script_path).expanduser().resolve()
+    if not script_path.is_file():
+        raise FileNotFoundError(
+            f"Generation args script not found: {script_path}"
+        )
+
+    module_name = (
+        f"_d2cache_gen_args_{hashlib.sha256(str(script_path).encode()).hexdigest()[:12]}"
+    )
+    spec = spec_from_file_location(module_name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Failed to create module spec for generation args script: {script_path}"
+        )
+
+    module = module_from_spec(spec)
+    sys.modules[module_name] = module
+    sys.path.insert(0, str(script_path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+
+    get_generation_args = getattr(module, "get_generation_args", None)
+    if not callable(get_generation_args):
+        raise AttributeError(
+            f"Generation args script {script_path} must define a callable `get_generation_args`."
+        )
+
+    return cast(Callable[..., dict], get_generation_args)
+
+
 def pre_initialize(cfg: DictConfig) -> dict:
     """
     Pre-initialize the environment and configuration. Returns a dictionary with additional configurations.
     """
-    sys.path.insert(0, str(Path(__file__).parents[2] / "configs"))
     import src.generation # triger registration of all generation methods
-    from gen_args import get_generation_args  # type: ignore
+
+    repo_root = Path(__file__).parents[2]
 
     # basic environment settings
     load_dotenv()
@@ -132,11 +168,23 @@ def pre_initialize(cfg: DictConfig) -> dict:
     # process additional configs
     cache_choice = HydraConfig.get().runtime.choices.get("cache", None)
     gen_strategy_choice = HydraConfig.get().runtime.choices.get("gen_strategy", None)
-    generation_args = get_generation_args(
-        cfg.dataset.name,
-        cfg.model.name,
-        cache_choice,
-    ).model_dump()
+    generation_args = {}
+    if gen_args_script := cfg.get("gen_args_script", None):
+        gen_args_script = Path(gen_args_script)
+        if not gen_args_script.is_absolute():
+            gen_args_script = repo_root / gen_args_script
+        loader = load_generation_args(gen_args_script)
+        logger.info(f"Loading generation args from {gen_args_script.resolve()}.")
+        generation_args = loader(
+            cfg.dataset.name,
+            cfg.model.name,
+            cache_choice,
+        )
+        if not isinstance(generation_args, dict):
+            raise TypeError(
+                "`get_generation_args` must return a dict containing generation defaults."
+            )
+        
     cache_args = generation_args.pop("cache_args", {})
     default_overrides = []
     if gen_strategy_choice is not None:

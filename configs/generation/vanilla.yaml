@@ -8,7 +8,7 @@ factor: null # factor-based parallel decoding factor
 alg: "maskgit_plus"
 gen_length: null
 block_length: null
-steps: null
+num_transfer_tokens: 1
 temperature: 0.0
 top_p: null
 top_k: null

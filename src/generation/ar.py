@@ -7,7 +7,6 @@ from src.cache import dCache
 from src.frame import Frame, DecodeRecord
 from src.generation.vanilla import (
     generate_step,
-    get_num_transfer_tokens,
 )
 from src.generation.utils import register
 
@@ -41,7 +40,7 @@ def get_ar_prefix_mask(transfer_index_mask: torch.Tensor) -> torch.Tensor:
 def autoregressive_unmasking(
     scores: torch.Tensor,
     transfer_index_mask: torch.Tensor,
-    min_transfer_tokens: torch.Tensor,
+    min_transfer_tokens: torch.Tensor | int,
     threshold: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """
@@ -62,6 +61,10 @@ def autoregressive_unmasking(
     """
     batch_size, seq_len = scores.shape
     device = scores.device
+    if isinstance(min_transfer_tokens, int):
+        min_transfer_tokens = torch.full(
+            (batch_size,), min_transfer_tokens, device=device, dtype=torch.long
+        )
     positions = torch.arange(seq_len, device=device).expand(batch_size, -1)
     allowed_count = transfer_index_mask.sum(dim=-1)
     start = torch.where(
@@ -101,9 +104,9 @@ def ar_generate(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     alg: str = "maskgit_plus",
-    steps: int = 128,
     block_length: int = 32,
     gen_length: int = 128,
+    num_transfer_tokens: int = 1,
     temperature: float = 0.0,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -124,10 +127,10 @@ def ar_generate(
     Args:
         model: Mask predictor.
         input_ids: A tensor of shape (B, prompt_len).
-        steps: Sampling steps, less than or equal to gen_length.
         block_length: Block length, less than or equal to gen_length. Each block
             is decoded autoregressively from left to right.
         gen_length: Generated answer length.
+        num_transfer_tokens: Minimum number of tokens to transfer per decoding step.
         temperature: Categorical distribution sampling temperature.
         mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
         pad_token_id: The token id of [PAD].
@@ -153,14 +156,8 @@ def ar_generate(
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
-
-    assert steps % num_blocks == 0
-    steps_per_block = steps // num_blocks
-
-    if threshold is None and steps != gen_length:
-        raise ValueError(
-            "Autoregressive decoding requires steps == gen_length unless threshold-based parallel decoding is enabled."
-        )
+    if num_transfer_tokens <= 0:
+        raise ValueError(f"{num_transfer_tokens=} must be > 0")
 
     initial_frame = Frame.create_initial_frame(
         input_ids,
@@ -186,7 +183,7 @@ def ar_generate(
         probs: torch.Tensor,
         transfer_index_mask: torch.Tensor,
         block_mask: torch.Tensor,
-        num_transfer_tokens: torch.Tensor,
+        num_transfer_tokens: int,
     ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]]:
         active_transfer_mask = transfer_index_mask & block_mask
         ar_transfer_mask = get_ar_prefix_mask(active_transfer_mask)
@@ -213,20 +210,19 @@ def ar_generate(
             block_idx * block_length : (block_idx + 1) * block_length,
         ] = True
 
-        num_transfer_tokens = get_num_transfer_tokens(block_mask, steps_per_block)
         start_frame = frame.clone()
         if cache is not None:
             cache.on_block_start(block_mask, frame)
 
         block_deltas = []
-        for step_idx in range(steps_per_block):
+        while True:
             if cache is not None:
                 cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
                 block_mask=block_mask,
-                num_transfer_tokens=num_transfer_tokens[:, step_idx],
+                num_transfer_tokens=num_transfer_tokens,
                 unmasking_fn=unmasking_fn,
                 attention_mask=attention_mask,
                 past_key_values=cache,

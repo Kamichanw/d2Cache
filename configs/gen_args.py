@@ -6,7 +6,6 @@ from typing import Literal
 class GenerationArgs(BaseModel):
     gen_length: int = Field(ge=0)
     block_length: int = Field(ge=0)
-    steps: int = Field(ge=0)
 
     alg: Literal["maskgit_plus", "entropy", "topk_margin"] = Field(
         default="maskgit_plus"
@@ -20,20 +19,19 @@ class GenerationArgs(BaseModel):
 
     @model_validator(mode="after")
     def check_constraints(self):
-        if self.block_length > self.gen_length or self.steps > self.gen_length:
+        if self.block_length > self.gen_length:
             raise ValueError(
-                f"{self.block_length=} and {self.steps=} must be <= {self.gen_length=}"
+                f"{self.block_length=} must be <= {self.gen_length=}"
             )
-        num_blocks = self.gen_length // self.block_length
-        if self.gen_length % self.block_length != 0 or self.steps % num_blocks != 0:
+        if self.gen_length % self.block_length != 0:
             raise ValueError(
-                f"{self.gen_length=} must be divisible by {self.block_length=} and {self.steps=} must be divisible by number of blocks {num_blocks=}"
+                f"{self.gen_length=} must be divisible by {self.block_length=}"
             )
 
         return self
 
 
-def get_generation_args(task: str, model: str, cache: str | None = None):
+def get_generation_args(task: str, model: str, cache: str | None = None) -> dict:
     cache_args = {}
     alg = "maskgit_plus"
     block_length = None
@@ -62,7 +60,6 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
             gen_length = 512
 
     block_length = 32 if model.endswith("inst") else gen_length
-    steps = gen_length
 
     # set cache args
     match cache:
@@ -153,11 +150,10 @@ def get_generation_args(task: str, model: str, cache: str | None = None):
     return GenerationArgs(
         gen_length=gen_length,
         block_length=block_length,
-        steps=steps,
         alg=alg,
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         sigma=sigma,
         cache_args=cache_args,
-    )
+    ).model_dump()

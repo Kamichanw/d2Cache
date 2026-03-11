@@ -9,7 +9,6 @@ from src.frame import Frame, DecodeRecord
 from src.generation.vanilla import (
     confidence_unmasking,
     generate_step,
-    get_num_transfer_tokens,
 )
 from src.generation.utils import register
 
@@ -20,9 +19,9 @@ def klass_generate(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     alg: str = "maskgit_plus",
-    steps: int = 128,
     block_length: int = 32,
     gen_length: int = 128,
+    num_transfer_tokens: int = 1,
     temperature: float = 0.0,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -59,9 +58,8 @@ def klass_generate(
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
-
-    assert steps % num_blocks == 0
-    steps_per_block = steps // num_blocks
+    if num_transfer_tokens <= 0:
+        raise ValueError(f"{num_transfer_tokens=} must be > 0")
 
     initial_frame = Frame.create_initial_frame(
         input_ids,
@@ -100,7 +98,7 @@ def klass_generate(
         probs: torch.Tensor,
         transfer_index_mask: torch.Tensor,
         block_mask: torch.Tensor,
-        num_transfer_tokens: torch.Tensor,
+        num_transfer_tokens: int,
     ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]]:
         active_transfer_mask = transfer_index_mask & block_mask
 
@@ -121,7 +119,7 @@ def klass_generate(
         stable_transfer_index = confidence_unmasking(
             scores=scores,
             transfer_index_mask=stable_transfer_mask,
-            min_transfer_tokens=torch.zeros_like(num_transfer_tokens),
+            min_transfer_tokens=0,
             threshold=threshold,
             factor=factor,
         )
@@ -157,19 +155,18 @@ def klass_generate(
             block_idx * block_length : (block_idx + 1) * block_length,
         ] = True
 
-        num_transfer_tokens = get_num_transfer_tokens(block_mask, steps_per_block)
         start_frame = frame.clone()
         if cache is not None:
             cache.on_block_start(block_mask, frame)
         block_deltas = []
-        for step_idx in range(steps_per_block):
+        while True:
             if cache is not None:
                 cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
                 block_mask=block_mask,
-                num_transfer_tokens=num_transfer_tokens[:, step_idx],
+                num_transfer_tokens=num_transfer_tokens,
                 unmasking_fn=unmasking_fn,
                 attention_mask=attention_mask,
                 past_key_values=cache,

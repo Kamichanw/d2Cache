@@ -7,7 +7,7 @@ threshold: null # all tokens whose confidence is above this threshold will be fi
 alg: "maskgit_plus"
 gen_length: null
 block_length: null
-steps: null
+num_transfer_tokens: 1
 temperature: 0.0
 top_p: null
 top_k: null
