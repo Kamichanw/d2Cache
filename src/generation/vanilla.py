@@ -20,7 +20,7 @@ def generate_step(
     model,
     frame: Frame,
     block_mask: torch.Tensor,
-    num_transfer_tokens: torch.Tensor | int,
+    num_transfer_tokens: int,
     unmasking_fn: Callable,
     attention_mask: torch.Tensor | None = None,
     past_key_values: dCache | None = None,
@@ -40,17 +40,6 @@ def generate_step(
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
     device = block_mask.device
-
-    if isinstance(num_transfer_tokens, torch.Tensor):
-        if num_transfer_tokens.numel() != batch_size or num_transfer_tokens.dim() != 1:
-            raise ValueError(
-                f"`num_transfer_tokens` must be a tensor of shape ({batch_size},) or a single integer, "
-                f"but got shape of {num_transfer_tokens.shape}."
-            )
-    else:
-        num_transfer_tokens = torch.full(
-            (batch_size,), num_transfer_tokens, device=device, dtype=torch.long
-        )
 
     can_generate = check_can_generate(
         frame,
@@ -75,7 +64,6 @@ def generate_step(
         attention_mask[active_seq_idx] if attention_mask is not None else None
     )
     block_mask = block_mask[active_seq_idx]
-    num_transfer_tokens = num_transfer_tokens[active_seq_idx]
     outputs = model(
         x,
         attention_mask=attention_mask,
@@ -151,40 +139,10 @@ def generate_step(
     )
 
 
-def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
-    """
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
-    the expected number of tokens transitioned at each step should be consistent.
-    This function is designed to precompute the number of tokens that need to be transitioned at each step.
-
-    Args:
-
-    Returns:
-        A tensor of shape (B, steps) indicating the number of tokens to be transferred at each step.
-    """
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-
-    base = mask_num // steps
-    remainder = mask_num % steps
-
-    num_transfer_tokens = (
-        torch.zeros(
-            mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
-        )
-        + base
-    )
-
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, : remainder[i]] += 1
-
-    return num_transfer_tokens
-
-
 def confidence_unmasking(
     scores: torch.Tensor,
     transfer_index_mask: torch.Tensor,
-    min_transfer_tokens: torch.Tensor,
+    min_transfer_tokens: torch.Tensor | int,
     max_transfer_tokens: torch.Tensor | None = None,
     # parallel decoding
     threshold: float | torch.Tensor | None = None,
@@ -213,6 +171,14 @@ def confidence_unmasking(
         )
 
     batch_size, _ = scores.shape
+
+    if isinstance(min_transfer_tokens, int):
+        min_transfer_tokens = torch.full(
+            (batch_size,),
+            min_transfer_tokens,
+            device=scores.device,
+            dtype=torch.long,
+        )
 
     if min_transfer_tokens.numel() != batch_size:
         raise ValueError(
@@ -309,9 +275,9 @@ def vanilla_generate(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     alg: str = "maskgit_plus",
-    steps: int = 128,
     block_length: int = 32,
     gen_length: int = 128,
+    num_transfer_tokens: int = 1,
     temperature: float = 0.0,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -337,9 +303,9 @@ def vanilla_generate(
     Args:
         model: Mask predictor.
         input_ids: A tensor of shape (B, prompt_len).
-        steps: Sampling steps, less than or equal to gen_length.
         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
         gen_length: Generated answer length.
+        num_transfer_tokens: Minimum number of tokens to transfer per decoding step.
         temperature: Categorical distribution sampling temperature.
         mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
         pad_token_id: The token id of [PAD].
@@ -367,9 +333,8 @@ def vanilla_generate(
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
-
-    assert steps % num_blocks == 0
-    steps_per_block = steps // num_blocks
+    if num_transfer_tokens <= 0:
+        raise ValueError(f"{num_transfer_tokens=} must be > 0")
 
     initial_frame = Frame.create_initial_frame(
         input_ids,
@@ -394,7 +359,7 @@ def vanilla_generate(
         probs: torch.Tensor,
         transfer_index_mask: torch.Tensor,
         block_mask: torch.Tensor,
-        num_transfer_tokens: torch.Tensor,
+        num_transfer_tokens: int,
     ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]]:
         return (
             # select tokens to transfer based on probs and mask
@@ -423,19 +388,18 @@ def vanilla_generate(
             block_idx * block_length : (block_idx + 1) * block_length,
         ] = True
 
-        num_transfer_tokens = get_num_transfer_tokens(block_mask, steps_per_block)
         start_frame = frame.clone()
         if cache is not None:
             cache.on_block_start(block_mask, frame)
         block_deltas = []
-        for step_idx in range(steps_per_block):
+        while True:
             if cache is not None:
                 cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
                 block_mask=block_mask,
-                num_transfer_tokens=num_transfer_tokens[:, step_idx],
+                num_transfer_tokens=num_transfer_tokens,
                 unmasking_fn=unmasking_fn,
                 attention_mask=attention_mask,
                 past_key_values=cache,

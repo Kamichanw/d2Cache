@@ -61,7 +61,7 @@ A decoding strategy is implemented as a function that accepts the model, input i
 3.  **Iterative Generation Loop**: 
     Implement the core loop that drives the generation process. This typically involves:
     *   **Step Execution**: Calling `generate_step` (or a custom step function) to perform a forward pass and sample new tokens.
-    *   **Delta Application**: The step function returns a `FrameDelta`, which contains the changes (new tokens, confidence scores) to be applied to the frame.
+    *   **Delta Application**: The step function returns a `FrameDelta`, which contains the changes (new tokens, confidence scores) to be applied to the frame. Both `Frame` and `FrameDelta` may describe either a single sequence or a batch of sequences, so shape conventions should stay consistent with the current decoding mode.
     *   **State Update**: Apply the delta to the frame using `frame.apply_delta(delta)`.
 
 4.  **Result Compilation**: 
@@ -71,15 +71,17 @@ A decoding strategy is implemented as a function that accepts the model, input i
 
 ```python
 @register("iterative_refinement")
-def iterative_refinement_generate(model, input_ids, steps=5, ...):
+def iterative_refinement_generate(model, input_ids, num_transfer_tokens=1, ...):
     # 1. Initialize
     frame = Frame.create_initial_frame(input_ids, ...)
     deltas = []
     
     # 2. Loop
-    for i in range(steps):
+    while True:
         # 3. Generate Step
         delta = generate_step(model, frame, ...)
+        if delta is None:
+            break
         
         # 4. Update
         frame = frame.apply_delta(delta)
@@ -93,11 +95,11 @@ def iterative_refinement_generate(model, input_ids, steps=5, ...):
 To use your custom strategy, create a new YAML configuration file in `configs/generation/` (e.g., `configs/generation/my_strategy.yaml`).
 ```yaml
 name: my_strategy  # Matches the name used in @register
-steps: 10
+num_transfer_tokens: 1
 # ... other parameters passed to the function
 ```
 
-If your strategy requires complex validation or dynamic default values, update `configs/gen_args.py`. The `GenerationArgs` Pydantic model defines the schema and validation rules.
+If your strategy requires complex validation or dynamic default values, provide a `gen_args_script` and implement the corresponding schema there. The default `configs/gen_args.py` can be used as a reference.
 
 To use the new configuration:
 ```bash

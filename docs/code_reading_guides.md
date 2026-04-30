@@ -6,8 +6,8 @@ Thank you for your interest in our work. This document provides an overview of t
 
 To facilitate the analysis and logging of the generation process, we have designed three core classes within `src/frame.py`: `DecodeRecord`, `Frame`, and `FrameDelta`. Their relationship is illustrated in the figure above.
 
-- **`Frame`**: Stores comprehensive information about a generation state, including prompts, generated tokens, and the decoding timestep for each previously masked token.
-- **`FrameDelta`**: Represents the changes between two consecutive steps. It includes the tokens decoded at a specific step and the indices of any transferred tokens.
+- **`Frame`**: Stores comprehensive information about a generation state, including prompts, generated tokens, and the decoding timestep for each previously masked token. It supports both a single sequence (1D tensors) and a batch of sequences (2D tensors).
+- **`FrameDelta`**: Represents the changes between two consecutive steps. It includes the tokens decoded at a specific step and the indices of any transferred tokens. It likewise supports both single-sequence data (for example, `decoded_tokens.shape == (gen_length,)`) and batched data (for example, `decoded_tokens.shape == (batch_size, gen_length)`, excluding finished sequences where applicable).
 - **`DecodeRecord`**: Aggregates the entire decoding trajectory. It consists of an initial `Frame` (containing the prompt and the response segment initialized with mask tokens) and a sequence of $T-1$ `FrameDelta` objects. To reconstruct the state at a specific step $t$, the preceding $t-1$ deltas are sequentially applied to the initial `Frame` using the `Frame.apply_delta` method.
 
 The implementations of the generation methods are located in the `src/generation/` directory.

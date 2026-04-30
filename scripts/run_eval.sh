@@ -1,7 +1,6 @@
 # An example to evaluate parallel decoding on LLaDA-8B-Instruct/HumanEval
 # More methods please refer to docs
-export HF_HOME=/mnt/local/tmpp/.cache/huggingface
-export CUDA_VISIBLE_DEVICES=7
+
 accelerate launch \
     --num_machines 1 \
     --num_processes 1 \

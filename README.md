@@ -108,7 +108,7 @@ Available datasets:
 > [!IMPORTANT]
 > To evaluate humaneval dataset on Dream-v0-Instruct-7B, please use its corresponding instruct variants, i.e., `humaneval_instruct`.
 
-Additional general arguments can be specified in `configs/generation/*.yaml` or `configs/gen_args.py`.
+Additional general arguments can be specified in `configs/generation/*.yaml`. If `gen_args_script` is provided, dynamic defaults will be loaded from that script.
 
 # Starchart
 

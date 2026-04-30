@@ -49,7 +49,6 @@ class Registry:
         return list(self._registry.keys())
 
 
-
 class Timer:
     """
     Basic timer context manager for measuring CPU or GPU time.
@@ -235,7 +234,9 @@ def tensor_insert(dest_tensor, insert_index, src) -> torch.Tensor:
     Inserts a source tensor or value into a destination tensor along dimension 1.
 
     This function is specialized for sequence data with shapes like (B, L, ...),
-    where B is the batch size and L is the sequence length.
+    where B is the batch size and L is the sequence length. `Frame.apply_delta()`
+    normalizes single-sequence `Frame` and `FrameDelta` objects into this batched
+    layout before calling this helper.
 
     Args:
         dest_tensor (torch.Tensor): The destination tensor, e.g., of shape (B, L, D).
@@ -296,6 +297,9 @@ def tensor_insert(dest_tensor, insert_index, src) -> torch.Tensor:
 def tensor_delete(src_tensor: torch.Tensor, delete_index: torch.Tensor) -> torch.Tensor:
     """
     Deletes elements from each row of a (B, L) tensor.
+
+    `Frame.apply_delta()` converts single-sequence `FrameDelta.delete_index` values of
+    shape `(K,)` into this batched `(B, K)` layout before calling this helper.
 
     Args:
         src_tensor (torch.Tensor): The tensor to delete from, shape (B, L).
@@ -459,11 +463,7 @@ def top_up_mask_(
     max_num_to_pad = int(num_to_pad_per_seq.max())
     scores = torch.where(mask, -torch.inf, scores)
 
-    _, indices = torch.topk(
-        scores,
-        k=max_num_to_pad,
-        dim=-1,
-    )
+    _, indices = torch.topk(scores, k=max_num_to_pad, dim=-1)
 
     # select the indices that really need to be set to true
     pad_indices = indices.masked_select(
@@ -472,8 +472,7 @@ def top_up_mask_(
     )
 
     row_indices = torch.repeat_interleave(
-        torch.arange(B, device=device),
-        num_to_pad_per_seq.long(),
+        torch.arange(B, device=device), num_to_pad_per_seq.long()
     )
     mask[row_indices, pad_indices] = True
 

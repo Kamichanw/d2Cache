@@ -174,20 +174,19 @@ class dCache:
         else:
             q, k, v = x[:, 0:0], x[:, 0:0], x[:, 0:0]
 
-        if layer_idx == 0:
-            self._attention_mask = AttentionContext.convert_attention_mask(
-                attention_mask,
-                dtype=q.dtype,
-                query_length=q.shape[1],
-                key_value_length=k.shape[1],
-            )
-
         ctx = AttentionContext(
             q=q,
             k=k,
             v=v,
             residual=residual,
-            attention_mask=self._attention_mask,
+            # technically, attention_mask can be only computed at layer 0, but to support gradient checkpointing,
+            # we compute it at each layer here.
+            attention_mask=AttentionContext.convert_attention_mask(
+                attention_mask,
+                dtype=q.dtype,
+                query_length=q.shape[1],
+                key_value_length=k.shape[1],
+            ),
             q_position_ids=position_ids,
             kv_position_ids=position_ids,
         )
