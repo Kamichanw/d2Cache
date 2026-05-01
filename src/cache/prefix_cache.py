@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from contextlib import contextmanager
 
+from transformers.cache_utils import StaticLayer
+
 from src.frame import Frame, FrameDelta
 from src.cache.base import dCache, AttentionContext
 from src.utils import is_adapted_from_ar
@@ -14,10 +16,7 @@ class PrefixCache(dCache):
     def __init__(self, model_config, use_dual: bool = False):
         super().__init__(model_config)
         self.use_dual = use_dual
-        self.key_cache: list[torch.Tensor] = []
-        self.value_cache: list[torch.Tensor] = []
         self.active_q_mask: torch.Tensor | None = None
-        self._new_block_start = False
 
     @contextmanager
     def model_forward(self, x: torch.Tensor):
@@ -62,15 +61,26 @@ class PrefixCache(dCache):
             attention_mask,
             position_ids,
         ) as ctx:
-            if len(self.key_cache) <= layer_idx:
+            if (
+                layer_idx >= len(self.layers)
+                or not self.layers[layer_idx].is_initialized
+            ):
                 # the first forward pass, store states as cache
-                self.key_cache.append(ctx.k)
-                self.value_cache.append(ctx.v)
-            elif self._new_block_start:
-                self.key_cache[layer_idx][self.active_seq_mask] = ctx.k
-                self.value_cache[layer_idx][self.active_seq_mask] = ctx.v
+                while len(self.layers) <= layer_idx:
+                    self.layers.append(StaticLayer(x.shape[1]))
+                layer = self.layers[layer_idx]
+                if layer.keys is None or layer.values is None:
+                    self.update(ctx.k, ctx.v, layer_idx)
+                    layer = self.layers[layer_idx]
+                    assert layer.keys is not None and layer.values is not None
+                else:
+                    layer.keys[self.active_seq_mask] = ctx.k
+                    layer.values[self.active_seq_mask] = ctx.v
+                    layer.is_initialized = True
             else:
                 assert self.active_q_mask is not None
+                layer = self.layers[layer_idx]
+                assert layer.keys is not None and layer.values is not None
                 if layer_idx == 0:
                     active_seq_idx = torch.where(self.active_seq_mask)[0]
                     m_nonzero = self.active_q_mask.nonzero(as_tuple=False)
@@ -79,12 +89,11 @@ class PrefixCache(dCache):
                         m_nonzero[:, 1],
                     )
 
-                self.key_cache[layer_idx][self._active_q_indices] = ctx.k.flatten(0, 1)
-                self.value_cache[layer_idx][self._active_q_indices] = ctx.v.flatten(
-                    0, 1
-                )
-                ctx.k = self.key_cache[layer_idx][self.active_seq_mask]
-                ctx.v = self.value_cache[layer_idx][self.active_seq_mask]
+                rows, cols = self._active_q_indices
+                layer.keys[rows, :, cols, :] = ctx.k.transpose(1, 2).flatten(0, 1)
+                layer.values[rows, :, cols, :] = ctx.v.transpose(1, 2).flatten(0, 1)
+                ctx.k = layer.keys[self.active_seq_mask]
+                ctx.v = layer.values[self.active_seq_mask]
 
             if layer_idx == 0:
                 # cache common variables sharing among layers
@@ -96,8 +105,8 @@ class PrefixCache(dCache):
                 self._attention_mask = AttentionContext.convert_attention_mask(
                     attention_mask,
                     dtype=ctx.k.dtype,
-                    query_length=ctx.q.shape[1],
-                    key_value_length=self.value_cache[layer_idx].shape[1],
+                    query_length=ctx.q.shape[-2],
+                    key_value_length=layer.values.shape[-2],
                 )
 
             ctx.q_position_ids = self._q_position_ids
@@ -106,7 +115,9 @@ class PrefixCache(dCache):
 
             yield ctx
 
-    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
+    def on_step_end(
+        self, model, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta
+    ):
         if self.active_q_mask is None:
             q_mask = F.pad(block_mask, (frame.prompts.size(-1), 0), value=False)
             if not self.use_dual:
@@ -117,10 +128,8 @@ class PrefixCache(dCache):
                 q_mask = F.pad(q_mask[:, 1:], (0, 1), value=False)
 
             self.active_q_mask = q_mask
-        self._new_block_start = False
 
-    def on_block_start(self, block_mask: torch.Tensor, frame: Frame):
-        # we set the internal flag `_new_block_start` instead of cleaning caches as empty list,
-        # as the original batch-dim of caches must be kept.
-        self._new_block_start = True
+    def on_block_start(self, model, block_mask: torch.Tensor, frame: Frame):
+        for layer in self.layers:
+            layer.is_initialized = False
         self.active_q_mask = None

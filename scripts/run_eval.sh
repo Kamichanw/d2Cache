@@ -3,11 +3,11 @@
 
 accelerate launch \
     --num_machines 1 \
-    --num_processes 1 \
+    --num_processes 4 \
     eval.py \
     dataset.name=humaneval \
-    dataset.size=10 \
     batch_size=1 \
     seed=1234 \
     generation=vanilla \
-    model=llada-inst 
+    generation.stop_until_eos=true \
+    model=sdar-8b-chat 

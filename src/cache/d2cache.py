@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import contextmanager
+from transformers.cache_utils import StaticLayer
 
 from src.frame import Frame, FrameDelta
 from src.utils import (
@@ -24,8 +25,6 @@ class d2Cache(dCache):
         inflate_w: int = 4,
     ):
         super().__init__(model_config)
-        self.key_cache: list[torch.Tensor] = []
-        self.value_cache: list[torch.Tensor] = []
         self._conf_cache: torch.Tensor | None = None  # shape (B, G)
         self._full_q_mask: torch.Tensor | None = None  # shape (B, T)
         self._density_score: torch.Tensor  # shape (B, G)
@@ -76,12 +75,20 @@ class d2Cache(dCache):
             attention_mask,
             position_ids,
         ) as ctx:
-            if len(self.key_cache) <= layer_idx:
+            if (
+                layer_idx >= len(self.layers)
+                or not self.layers[layer_idx].is_initialized
+            ):
                 # the first forward pass, store states as cache
-                self.key_cache.append(ctx.k)
-                self.value_cache.append(ctx.v)
+                while len(self.layers) <= layer_idx:
+                    self.layers.append(StaticLayer(x.shape[1]))
+                self.update(ctx.k, ctx.v, layer_idx)
+                layer = self.layers[layer_idx]
+                assert layer.keys is not None and layer.values is not None
             else:
                 assert self.active_q_mask is not None
+                layer = self.layers[layer_idx]
+                assert layer.keys is not None and layer.values is not None
                 if layer_idx == 0:
                     active_seq_idx = torch.where(self.active_seq_mask)[0]
                     m_nonzero = self.active_q_mask.nonzero(as_tuple=False)
@@ -90,12 +97,11 @@ class d2Cache(dCache):
                         m_nonzero[:, 1],
                     )
 
-                self.key_cache[layer_idx][self._active_q_indices] = ctx.k.flatten(0, 1)
-                self.value_cache[layer_idx][self._active_q_indices] = ctx.v.flatten(
-                    0, 1
-                )
-                ctx.k = self.key_cache[layer_idx][self.active_seq_mask]
-                ctx.v = self.value_cache[layer_idx][self.active_seq_mask]
+                rows, cols = self._active_q_indices
+                layer.keys[rows, :, cols, :] = ctx.k.transpose(1, 2).flatten(0, 1)
+                layer.values[rows, :, cols, :] = ctx.v.transpose(1, 2).flatten(0, 1)
+                ctx.k = layer.keys[self.active_seq_mask]
+                ctx.v = layer.values[self.active_seq_mask]
 
             if layer_idx == 0:
                 # cache common variables sharing among layers
@@ -107,8 +113,8 @@ class d2Cache(dCache):
                 self._attention_mask = AttentionContext.convert_attention_mask(
                     attention_mask,
                     dtype=ctx.k.dtype,
-                    query_length=ctx.q.shape[1],
-                    key_value_length=self.value_cache[layer_idx].shape[1],
+                    query_length=ctx.q.shape[-2],
+                    key_value_length=layer.values.shape[-2],
                 )
 
             ctx.q_position_ids = self._q_position_ids
@@ -123,7 +129,7 @@ class d2Cache(dCache):
             if layer_idx == 0:
                 # shape: (B, pooled_size, pooled_size)
                 self._attn_rollout = torch.eye(
-                    self.key_cache[layer_idx].size(1), device=x.device, dtype=x.dtype
+                    layer.keys.size(-2), device=x.device, dtype=x.dtype
                 ).expand(x.size(0), -1, -1)
             self.accumulate_attn_rollout(ctx.attn_weight)
 
@@ -173,7 +179,9 @@ class d2Cache(dCache):
 
         self._attn_rollout = residual_attn @ self._attn_rollout
 
-    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
+    def on_step_end(
+        self, model, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta
+    ):
         confidence = delta.confidence
         assert confidence is not None
         B, P = frame.prompts.shape

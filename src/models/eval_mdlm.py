@@ -43,7 +43,7 @@ class EvalMDLM(TemplateLM):
         )
 
         # setup properties from LM
-        self._rank = self.accelerator.local_process_index
+        self._rank = self.accelerator.process_index
         self._world_size = self.accelerator.num_processes
 
         # setup custom properties
@@ -125,7 +125,9 @@ class EvalMDLM(TemplateLM):
             disable=disable_tqdm or not self.accelerator.is_main_process,
         ):
             context, until = map(list, zip(*(instance.args for instance in instances)))
-            if self.cfg.get("add_bos_token", False):
+            if self.cfg.get("add_bos_token", False) and getattr(
+                self.tokenizer, "bos_token_id", None
+            ):
                 context = [
                     (
                         self.tokenizer.bos_token + ctx
@@ -182,7 +184,7 @@ class EvalMDLM(TemplateLM):
 
                 out.extend(generated_answer)
             except torch.cuda.OutOfMemoryError:
-                out.append("[out-of-memory]")
+                out.extend(["[out-of-memory]"] * len(instances))
 
             # if you got a watchdog timeout error, you can uncomment this line to avoid it.
             # it will slow down the evaluation though.

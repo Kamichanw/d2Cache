@@ -2,6 +2,7 @@ from .base import dCache, AttentionContext, FFNContext, ModelForwardContext
 from .d2cache import d2Cache
 from .prefix_cache import PrefixCache
 from .dllm_cache import dLLMCache
+from .blockd_cache import BlockdCache
 
 __all__ = [
     "AttentionContext",
@@ -11,4 +12,5 @@ __all__ = [
     "d2Cache",
     "PrefixCache",
     "dLLMCache",
+    "BlockdCache",
 ]

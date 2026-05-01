@@ -17,11 +17,11 @@ def load_pretrained_model(cfg: DictConfig, **model_kwargs) -> PreTrainedModel:
     elif model_family == "dream":
         return DreamModel.from_pretrained(cfg.model.path, **model_kwargs)
     elif model_family == "sdar":
-        # Prefer the in-repo SDAR implementation (avoids `trust_remote_code`).
-        # Avoid overriding SDAR's attention implementation (often "flex_attention") via global config.
-        model_kwargs.pop("attn_implementation", None)
-        model_kwargs.pop("trust_remote_code", None)
         return SDARForCausalLM.from_pretrained(cfg.model.path, **model_kwargs)
+    else:
+        raise NotImplementedError(
+            f"Model family {model_family} is not implemented for loading."
+        )
 
     return model
 
@@ -81,10 +81,6 @@ def load_tokenizer(cfg: DictConfig, **tokenizer_kwargs):
             tokenizer.eot_token_id = tokenizer.convert_tokens_to_ids(
                 tokenizer.eot_token
             )
-        case "sdar":
-            # SDAR relies on mask_token_id for block diffusion; expose it on the tokenizer.
-            # Some tokenizers don't define a mask token, but we only need the id.
-            tokenizer.mask_token_id = cfg.generation.mask_token_id  # type: ignore[attr-defined]
     return tokenizer
 
 
@@ -108,5 +104,25 @@ def is_adapted_from_ar(
         return False
     elif config.model_type.lower() == "dream":
         return True
+    elif config.model_type.lower() == "sdar":
+        return True
     else:
         raise ValueError(f"Unsupported model type: {config.model_type}")
+
+
+def is_block_diffusion(
+    model_or_config: PreTrainedModel | PretrainedConfig,
+) -> bool:
+    """
+    Check whether a model uses block diffusion decoding semantics.
+    """
+    if isinstance(model_or_config, PreTrainedModel):
+        config = model_or_config.config
+    elif isinstance(model_or_config, PretrainedConfig):
+        config = model_or_config
+    else:
+        raise ValueError(
+            f"Expected model_or_config to be an instance of PreTrainedModel or PretrainedConfig, but got {type(model_or_config)}"
+        )
+
+    return config.model_type.lower() == "sdar"

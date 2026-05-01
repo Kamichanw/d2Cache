@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from transformers.cache_utils import Cache
 
 from src.frame import Frame, FrameDelta
 
@@ -21,7 +22,8 @@ class AttentionContext:
     # of shape (B, nh, q_len, seq_len)
     attn_weight: torch.Tensor | None = None
 
-    # if you select a subset of qkv, you must also provide these properties
+    # q/k/v use [batch, heads, seq, head_dim]. If you select a subset of
+    # qkv, you must also provide these properties.
     q_position_ids: torch.Tensor | None = None
     kv_position_ids: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
@@ -92,16 +94,27 @@ class ModelForwardContext:
     logits: torch.Tensor | None = None  # assigned from model
 
 
-class dCache:
+class dCache(Cache):
     """
     A cache structure used during diffusion language models decoding to reuse intermediate states.
     """
 
     def __init__(self, model_config):
+        super().__init__(layers=[])
         self.model_config = model_config
         self.active_q_mask: torch.Tensor | None = None
 
         self._active_seq_mask: torch.Tensor | None = None
+
+    @staticmethod
+    def split_heads(tensor: torch.Tensor, num_heads: int) -> torch.Tensor:
+        if tensor.dim() == 4:
+            return tensor
+        return (
+            tensor.view(tensor.size(0), tensor.size(1), num_heads, -1)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
     @property
     def active_seq_mask(self):
@@ -169,10 +182,16 @@ class dCache:
         """
         residual = x
         x = attn_norm(x)
+        q_heads = int(self.model_config.num_attention_heads)
+        kv_heads = int(self.model_config.num_key_value_heads)
         if x.numel() > 0:
-            q, k, v = q_proj(x), k_proj(x), v_proj(x)
+            q = self.split_heads(q_proj(x), q_heads)
+            k = self.split_heads(k_proj(x), kv_heads)
+            v = self.split_heads(v_proj(x), kv_heads)
         else:
-            q, k, v = x[:, 0:0], x[:, 0:0], x[:, 0:0]
+            q = x.new_empty(x.size(0), q_heads, 0, q_proj.out_features // q_heads)
+            k = x.new_empty(x.size(0), kv_heads, 0, k_proj.out_features // kv_heads)
+            v = x.new_empty(x.size(0), kv_heads, 0, v_proj.out_features // kv_heads)
 
         ctx = AttentionContext(
             q=q,
@@ -184,8 +203,8 @@ class dCache:
             attention_mask=AttentionContext.convert_attention_mask(
                 attention_mask,
                 dtype=q.dtype,
-                query_length=q.shape[1],
-                key_value_length=k.shape[1],
+                query_length=q.shape[-2],
+                key_value_length=k.shape[-2],
             ),
             q_position_ids=position_ids,
             kv_position_ids=position_ids,
@@ -224,47 +243,57 @@ class dCache:
                 f"The feed-forward network output shape {ctx.ffn_out.shape!r} is not compatible with the residual shape {ctx.residual.shape!r}."
             )
 
-    def on_step_start(self, block_mask: torch.Tensor, frame: Frame):
+    def on_step_start(self, model, block_mask: torch.Tensor, frame: Frame):
         """
         Called at the start of each generation step to update the cache with the current frame.
 
         Args:
+            model: The model used for generation.
             block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying the delta.
         """
         ...
 
-    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
+    def on_step_end(
+        self, model, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta
+    ):
         """
         Called at the end of each generation step to update the cache with the current frame and delta.
 
         Args:
+            model: The model used for generation.
             block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying the delta.
             delta (FrameDelta): The delta to apply to the frame.
         """
         ...
 
-    def on_block_start(self, block_mask: torch.Tensor, frame: Frame):
+    def on_block_start(self, model, block_mask: torch.Tensor, frame: Frame):
         """
         Called at the start of each block to update the cache with the current frame.
 
         Args:
+            model: The model used for generation.
             block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
             frame (Frame): The frame before applying any deltas in the block.
         """
         ...
 
     def on_block_end(
-        self, block_mask: torch.Tensor, frame: Frame, deltas: list[FrameDelta]
+        self,
+        model,
+        block_mask: torch.Tensor,
+        frame: Frame,
+        deltas: list[FrameDelta],
     ):
         """
         Called at the end of each block to update the cache with the current frame and deltas.
 
         Args:
             block_mask (torch.Tensor): A boolean mask indicating which positions in the block are active.
-            frame (Frame): The frame before applying all deltas in the block.
+            frame (Frame): The frame before applying any deltas in the block.
             deltas (list[FrameDelta]): The list of deltas applied in the block.
+            model: The model used for generation.
         """
         ...
 

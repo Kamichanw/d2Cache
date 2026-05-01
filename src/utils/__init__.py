@@ -117,13 +117,9 @@ def get_config_diff(d1: dict, d2: dict) -> dict:
 def load_generation_args(script_path: str | Path) -> Callable[..., dict]:
     script_path = Path(script_path).expanduser().resolve()
     if not script_path.is_file():
-        raise FileNotFoundError(
-            f"Generation args script not found: {script_path}"
-        )
+        raise FileNotFoundError(f"Generation args script not found: {script_path}")
 
-    module_name = (
-        f"_d2cache_gen_args_{hashlib.sha256(str(script_path).encode()).hexdigest()[:12]}"
-    )
+    module_name = f"_d2cache_gen_args_{hashlib.sha256(str(script_path).encode()).hexdigest()[:12]}"
     spec = spec_from_file_location(module_name, script_path)
     if spec is None or spec.loader is None:
         raise ImportError(
@@ -151,7 +147,7 @@ def pre_initialize(cfg: DictConfig) -> dict:
     """
     Pre-initialize the environment and configuration. Returns a dictionary with additional configurations.
     """
-    import src.generation # triger registration of all generation methods
+    import src.generation  # triger registration of all generation methods
 
     repo_root = Path(__file__).parents[2]
 
@@ -174,7 +170,10 @@ def pre_initialize(cfg: DictConfig) -> dict:
         if not gen_args_script.is_absolute():
             gen_args_script = repo_root / gen_args_script
         loader = load_generation_args(gen_args_script)
-        logger.info(f"Loading generation args from {gen_args_script.resolve()}.")
+        logger.info(
+            f"Loading generation args from {gen_args_script.resolve()}.",
+            rank_zero_only=True,
+        )
         generation_args = loader(
             cfg.dataset.name,
             cfg.model.name,
@@ -184,7 +183,7 @@ def pre_initialize(cfg: DictConfig) -> dict:
             raise TypeError(
                 "`get_generation_args` must return a dict containing generation defaults."
             )
-        
+
     cache_args = generation_args.pop("cache_args", {})
     default_overrides = []
     if gen_strategy_choice is not None:

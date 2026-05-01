@@ -4,8 +4,8 @@ from typing import Literal
 
 
 class GenerationArgs(BaseModel):
-    gen_length: int = Field(ge=0)
-    block_length: int = Field(ge=0)
+    max_new_tokens: int | None = Field(default=None, ge=0)
+    block_length: int | None = Field(default=None, ge=0)
 
     alg: Literal["maskgit_plus", "entropy", "topk_margin"] = Field(
         default="maskgit_plus"
@@ -19,13 +19,15 @@ class GenerationArgs(BaseModel):
 
     @model_validator(mode="after")
     def check_constraints(self):
-        if self.block_length > self.gen_length:
+        if self.max_new_tokens is None or self.block_length is None:
+            return self
+        if self.block_length > self.max_new_tokens:
             raise ValueError(
-                f"{self.block_length=} must be <= {self.gen_length=}"
+                f"{self.block_length=} must be <= {self.max_new_tokens=}"
             )
-        if self.gen_length % self.block_length != 0:
+        if self.max_new_tokens % self.block_length != 0:
             raise ValueError(
-                f"{self.gen_length=} must be divisible by {self.block_length=}"
+                f"{self.max_new_tokens=} must be divisible by {self.block_length=}"
             )
 
         return self
@@ -47,19 +49,19 @@ def get_generation_args(task: str, model: str, cache: str | None = None) -> dict
             | "gpqa_main_generative_n_shot"
             | "mmlu_pro"
         ):
-            gen_length = 256
+            max_new_tokens = 256
         case "humaneval" | "mbpp":
-            gen_length = 512
+            max_new_tokens = 512
         case task if "longbench" in task:
-            gen_length = 512
+            max_new_tokens = 512
         case _:
             logger.info(
                 f"Unsupported task {task}, you should specify in {__file__}."
-                " Using default gen_length=512."
+                " Using default max_new_tokens=512."
             )
-            gen_length = 512
+            max_new_tokens = 512
 
-    block_length = 32 if model.endswith("inst") else gen_length
+    block_length = 32 if model.endswith("inst") else max_new_tokens
 
     # set cache args
     match cache:
@@ -72,7 +74,7 @@ def get_generation_args(task: str, model: str, cache: str | None = None) -> dict
                 "inflate_w": 0,
             }
             # when using certainty prior (CP) guided decoding, block-wise semi-ar is no longer needed.
-            block_length = gen_length
+            block_length = max_new_tokens
             # but it is also possible to use CP guided decoding and block-wise semi-ar.
             # to achieve this, pass `generation.block_length=32 cache.inflate_w=4` in cli
         case "prefix":
@@ -147,16 +149,10 @@ def get_generation_args(task: str, model: str, cache: str | None = None) -> dict
         case "dream-base" | "dream-inst":
             top_p = 0.9
         case model if model.startswith("sdar"):
-            # SDAR block diffusion defaults (see SDAR repo `generate.py`)
             block_length = 4
-            # keep `steps=gen_length` so that per-block denoising steps can be derived as:
-            # denoising_steps = steps // (gen_length // block_length) == block_length
-            temperature = 1.0
-            top_p = 0.95
-            top_k = 50
 
     return GenerationArgs(
-        gen_length=gen_length,
+        max_new_tokens=max_new_tokens,
         block_length=block_length,
         alg=alg,
         temperature=temperature,

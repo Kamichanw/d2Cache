@@ -16,7 +16,7 @@
 import warnings
 import copy
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any
 
 import torch
 import torch.distributions as dists
@@ -97,21 +97,21 @@ def sample_tokens(
 @dataclass
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
-    history: Optional[Tuple[torch.FloatTensor]] = None
+    history: tuple[torch.FloatTensor] | None = None
 
 
 class DreamGenerationConfig(GenerationConfig):
     def __init__(self, **kwargs):
         self.temperature: float = kwargs.pop("temperature", 0.0)
-        self.top_p: Optional[float] = kwargs.pop("top_p", None)
-        self.top_k: Optional[int] = kwargs.pop("top_k", None)
+        self.top_p: float | None = kwargs.pop("top_p", None)
+        self.top_k: int | None = kwargs.pop("top_k", None)
         self.max_length = kwargs.pop("max_length", 20)
         self.max_new_tokens = kwargs.pop("max_new_tokens", None)
         # diffusion specific params
         self.eps: float = kwargs.pop("eps", 1e-3)
         self.steps: int = kwargs.pop("steps", 512)
         self.alg: str = kwargs.pop("alg", "origin")
-        self.alg_temp: Optional[float] = kwargs.pop("alg_temp", None)
+        self.alg_temp: float | None = kwargs.pop("alg_temp", None)
 
         # Parameters that define the output variables of `generate`
         self.num_return_sequences: int = kwargs.pop("num_return_sequences", 1)
@@ -157,9 +157,9 @@ class DreamGenerationMixin:
     @staticmethod
     def _expand_inputs_for_generation(
         expand_size: int = 1,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+    ) -> tuple[torch.LongTensor, dict[str, Any]]:
         """Expands tensors from [batch_size, ...] to [batch_size * expand_size, ...]"""
         # Do not call torch.repeat_interleave if expand_size is 1 because it clones
         # the input tensor and thus requires more memory although no change is applied
@@ -237,7 +237,7 @@ class DreamGenerationMixin:
         return generation_config
 
     def _prepare_generation_config(
-        self, generation_config: Optional[DreamGenerationConfig], **kwargs: Dict
+        self, generation_config: DreamGenerationConfig | None, **kwargs: dict
     ) -> DreamGenerationConfig:
         """
         Prepares the base generation config, then applies any generation configuration options from kwargs. This
@@ -273,7 +273,7 @@ class DreamGenerationMixin:
     def _prepare_special_tokens(
         self,
         generation_config: DreamGenerationConfig,
-        device: Optional[Union[torch.device, str]] = None,
+        device: torch.device | str | None = None,
     ):
         """
         Prepares the special tokens for generation, overwriting the generation config with their processed versions
@@ -330,10 +330,10 @@ class DreamGenerationMixin:
     @torch.no_grad()
     def diffusion_generate(
         self,
-        inputs: Optional[torch.Tensor] = None,
-        generation_config: Optional[DreamGenerationConfig] = None,
+        inputs: torch.Tensor | None = None,
+        generation_config: DreamGenerationConfig | None = None,
         **kwargs,
-    ) -> Union[DreamModelOutput, torch.LongTensor]:
+    ) -> DreamModelOutput | torch.LongTensor:
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         generation_config = self._prepare_generation_config(generation_config, **kwargs)
         generation_tokens_hook_func = kwargs.pop(
@@ -406,11 +406,11 @@ class DreamGenerationMixin:
     def _sample(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.LongTensor],
+        attention_mask: torch.LongTensor | None,
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
         generation_logits_hook_func,
-    ) -> Union[DreamModelOutput, torch.LongTensor]:
+    ) -> DreamModelOutput | torch.LongTensor:
         # init values
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate

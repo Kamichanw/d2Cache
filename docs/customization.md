@@ -52,7 +52,7 @@ A decoding strategy is implemented as a function that accepts the model, input i
 1.  **Frame Initialization**: 
     Create an initial `Frame` object. This object encapsulates the state of the generation, including the prompts and the current sequence of tokens (initially masked).
     ```python
-    frame = Frame.create_initial_frame(input_ids, gen_length=..., mask_token_id=...)
+    frame = Frame.create_initial_frame(input_ids, num_new_tokens=..., mask_token_id=...)
     ```
 
 2.  **Cache Initialization**: 
@@ -105,4 +105,3 @@ To use the new configuration:
 ```bash
 python eval.py generation=my_strategy ...
 ```
-

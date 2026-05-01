@@ -11,7 +11,7 @@ class SDAREval(EvalMDLM):
     """
     Evaluation wrapper for SDAR (Synergy of Diffusion and AutoRegression).
 
-    - Generation is handled by `src/generation/sdar.py` (strategy name: "sdar").
+    - Generation uses the shared diffusion strategies with BlockdCache.
     - Loglikelihood uses standard left-to-right causal LM scoring, so lm-eval
       tasks that rely on loglikelihood can run.
     """
@@ -74,4 +74,3 @@ class SDAREval(EvalMDLM):
             out.append((logprob, is_greedy))
 
         return out
-

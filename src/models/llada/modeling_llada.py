@@ -1,15 +1,9 @@
 from __future__ import annotations
 
 import math
-import sys
 from abc import abstractmethod
-from typing import (
-    Callable,
-    Union,
-    Optional,
-    Tuple,
-    cast,
-)
+from collections.abc import MutableMapping
+from typing import cast
 from dataclasses import dataclass
 
 import torch
@@ -32,13 +26,6 @@ from .configuration_llada import (
     LayerNormType,
 )
 
-
-if sys.version_info.minor > 8:
-    from collections.abc import MutableMapping
-elif sys.version_info.minor == 8:
-    from typing import MutableMapping
-else:
-    raise SystemExit("This script supports Python 3.8 or higher")
 
 __all__ = [
     "LayerNormBase",
@@ -101,8 +88,8 @@ class LayerNormBase(nn.Module):
         self,
         config: LLaDAConfig,
         *,
-        size: Optional[int] = None,
-        elementwise_affine: Optional[bool] = True,
+        size: int | None = None,
+        elementwise_affine: bool | None = True,
         eps: float = 1e-05,
     ):
         super().__init__()
@@ -130,7 +117,7 @@ class LayerNormBase(nn.Module):
 
     @classmethod
     def build(
-        cls, config: LLaDAConfig, size: Optional[int] = None, **kwargs
+        cls, config: LLaDAConfig, size: int | None = None, **kwargs
     ) -> LayerNormBase:
         if config.layer_norm_type == LayerNormType.default:
             return LayerNorm(config, size=size, low_precision=False, **kwargs)
@@ -146,7 +133,7 @@ class LayerNormBase(nn.Module):
             )
 
     def _cast_if_autocast_enabled(
-        self, tensor: torch.Tensor, dtype: Optional[torch.dtype] = None
+        self, tensor: torch.Tensor, dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         # NOTE: `is_autocast_enabled()` only checks for CUDA autocast, so we use the separate function
         # `is_autocast_cpu_enabled()` for CPU autocast.
@@ -171,9 +158,9 @@ class LayerNorm(LayerNormBase):
     def __init__(
         self,
         config: LLaDAConfig,
-        size: Optional[int] = None,
+        size: int | None = None,
         low_precision: bool = False,
-        elementwise_affine: Optional[bool] = None,
+        elementwise_affine: bool | None = None,
         eps: float = 1e-05,
     ):
         super().__init__(
@@ -221,8 +208,8 @@ class RMSLayerNorm(LayerNormBase):
     def __init__(
         self,
         config: LLaDAConfig,
-        size: Optional[int] = None,
-        elementwise_affine: Optional[bool] = None,
+        size: int | None = None,
+        elementwise_affine: bool | None = None,
         eps: float = 1e-5,
     ):
         super().__init__(
@@ -257,8 +244,8 @@ class GemmaRMSLayerNorm(LayerNormBase):
     def __init__(
         self,
         config: LLaDAConfig,
-        size: Optional[int] = None,
-        elementwise_affine: Optional[bool] = None,
+        size: int | None = None,
+        elementwise_affine: bool | None = None,
         eps: float = 1e-5,
     ):
         super().__init__(
@@ -302,7 +289,7 @@ class RotaryEmbedding(nn.Module):
 
     def get_rotary_embedding(
         self, seq_len: int, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             (pos_sin := self.__cache.get("rope_pos_sin")) is not None
             and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
@@ -351,7 +338,7 @@ class RotaryEmbedding(nn.Module):
         k: torch.Tensor,
         q_position_ids: torch.Tensor | None = None,
         kv_position_ids: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
@@ -473,8 +460,8 @@ class LLaDABlock(nn.Module):
         self.dropout = Dropout(config.residual_dropout)
 
         # Layer norms.
-        self.k_norm: Optional[LayerNormBase] = None
-        self.q_norm: Optional[LayerNormBase] = None
+        self.k_norm: LayerNormBase | None = None
+        self.q_norm: LayerNormBase | None = None
         if config.attention_layer_norm:
             self.k_norm = LayerNormBase.build(
                 config,
@@ -523,11 +510,11 @@ class LLaDABlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
@@ -577,30 +564,28 @@ class LLaDABlock(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        q_position_ids: Optional[torch.Tensor] = None,
-        kv_position_ids: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        q_position_ids: torch.Tensor | None = None,
+        kv_position_ids: torch.Tensor | None = None,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        B, T, C = q.size()  # batch size, sequence length, d_model
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        B, T = q.size(0), q.size(-2)
         dtype = k.dtype
 
         # Optionally apply layer norm to keys and queries.
         if self.q_norm is not None and self.k_norm is not None:
-            q = self.q_norm(q).to(dtype=dtype)
-            k = self.k_norm(k).to(dtype=dtype)
-
-        # Move head forward to be next to the batch dim.
-        # shape: (B, nh, T, hs)
-        q = q.view(B, -1, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
-        k = k.view(
-            B, -1, self.config.effective_n_kv_heads, C // self.config.n_heads
-        ).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
-        v = v.view(
-            B, -1, self.config.effective_n_kv_heads, C // self.config.n_heads
-        ).transpose(1, 2)
+            q = (
+                self.q_norm(q.transpose(1, 2).contiguous().view(B, T, -1))
+                .to(dtype=dtype)
+                .view(B, T, self.config.n_heads, q.size(-1))
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_norm(k.transpose(1, 2).contiguous().view(k.size(0), k.size(-2), -1))
+                .to(dtype=dtype)
+                .view(k.size(0), k.size(-2), self.config.effective_n_kv_heads, k.size(-1))
+                .transpose(1, 2)
+            )
 
         if self.config.rope:
             # Apply rotary embeddings.
@@ -619,7 +604,7 @@ class LLaDABlock(nn.Module):
         )
 
         # Re-assemble all head outputs side-by-side.
-        att = att.transpose(1, 2).contiguous().view(B, -1, C)
+        att = att.transpose(1, 2).contiguous().view(B, -1, self.config.d_model)
 
         # Apply output projection.
         return self.attn_out(att), attn_weight
@@ -628,11 +613,11 @@ class LLaDABlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[dCache] = None,
-        output_attentions: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attention_mask: torch.FloatTensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: dCache | None = None,
+        output_attentions: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         raise NotImplementedError
 
     @classmethod
@@ -700,11 +685,11 @@ class LLaDALlamaBlock(LLaDABlock):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[dCache] = None,
-        output_attentions: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: dCache | None = None,
+        output_attentions: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Get query, key, value projections.
         # shape:
         #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
@@ -714,7 +699,8 @@ class LLaDALlamaBlock(LLaDABlock):
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
 
         # create a dummy cache to simplify code
-        past_key_values = past_key_values or dCache(self.config)
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
         with past_key_values.attention(
             self.layer_id,
             x,
@@ -725,13 +711,13 @@ class LLaDALlamaBlock(LLaDABlock):
             attention_mask=attention_mask,
             position_ids=position_ids,
         ) as ctx:
-            q_mismatch = ctx.q.shape != x.shape and (
-                ctx.q_position_ids is None
-                or ctx.q_position_ids.shape != ctx.q.shape[:2]
+            q_mismatch = ctx.q_position_ids is not None and ctx.q_position_ids.shape != (
+                ctx.q.size(0),
+                ctx.q.size(-2),
             )
-            kv_mismatch = (ctx.k.shape != x.shape or ctx.v.shape != x.shape) and (
-                ctx.kv_position_ids is None
-                or ctx.kv_position_ids.shape != ctx.k.shape[:2]
+            kv_mismatch = ctx.kv_position_ids is not None and ctx.kv_position_ids.shape != (
+                ctx.k.size(0),
+                ctx.k.size(-2),
             )
             if q_mismatch or kv_mismatch:
                 raise ValueError(
@@ -751,7 +737,10 @@ class LLaDALlamaBlock(LLaDABlock):
                     or isinstance(past_key_values, d2Cache),
                 )
             else:
-                ctx.o, ctx.attn_weight = torch.empty_like(ctx.q), None
+                ctx.o = ctx.residual.new_empty(
+                    ctx.q.size(0), ctx.q.size(-2), self.config.d_model
+                )
+                ctx.attn_weight = None
 
         q, k, v, o = ctx.q, ctx.k, ctx.v, ctx.o  # keep them for visualization
         attn_weight = ctx.attn_weight
@@ -779,22 +768,22 @@ class LLaDAOutput(ModelOutput):
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
         attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    loss: Optional[torch.FloatTensor] = None  # never used, but kept for compatibility
-    logits: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    loss: torch.FloatTensor | None = None  # never used, but kept for compatibility
+    logits: torch.FloatTensor | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
 @dataclass
@@ -804,14 +793,14 @@ class LLaDAOutputWithPast(LLaDAOutput):
 
     Args:
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             head_size)`.
 
             Contains pre-computed key and value hidden states of the attention blocks that can be used to speed up
             decoding.
     """
 
-    past_key_values: Optional[dCache] = None
+    past_key_values: dCache | None = None
 
 
 @dataclass
@@ -986,15 +975,15 @@ class LLaDAModel(LLaDAPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[dCache] = None,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: dCache | None = None,
         use_cache: bool = False,
         last_logits_only: bool = False,
-        output_hidden_states: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1022,7 +1011,8 @@ class LLaDAModel(LLaDAPreTrainedModel):
         assert self.config.block_group_size == 1
 
         # create a dummy cache to simplify code
-        past_key_values = past_key_values or dCache(self.config)
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
         batch_size, seq_len = (
             input_ids.size()  # type: ignore
             if inputs_embeds is None
@@ -1153,17 +1143,17 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[dCache] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, LLaDAOutputWithPast]:
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: dCache | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+    ) -> tuple | LLaDAOutputWithPast:
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -1211,7 +1201,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
-        past_key_values: Optional[dCache] = None,
+        past_key_values: dCache | None = None,
         **kwargs,
     ):
         if past_key_values is None:

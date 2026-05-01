@@ -1,18 +1,121 @@
-import os
 import torch
 import torch.nn.functional as F
 import torch.distributions as dists
-from typing import Any, Callable, Type
+from typing import Any, Callable
 
-from src.cache import dCache
+from src.cache import BlockdCache, dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import (
     check_can_generate,
+    get_block_mask,
+    get_initial_new_tokens,
     prepare_logits_for_generation,
     sample_tokens,
     register,
 )
-from src.utils import certainty_density, is_adapted_from_ar
+from src.utils import certainty_density, is_adapted_from_ar, is_block_diffusion
+
+
+def maybe_extend_new_block(
+    frame: Frame,
+    delta: FrameDelta,
+    block_length: int,
+    active_seq_idx: torch.Tensor,
+    block_mask: torch.Tensor,
+    num_transfer_tokens: int,
+    stop_until_eos: bool,
+    mask_token_id: int,
+    eos_token_id: int | None,
+    max_new_tokens: int | None,
+):
+    """
+    Append a masked block when block diffusion generation exhausts the current block.
+
+    The returned delta first applies the sampled token updates, then inserts a
+    new masked suffix if the active sequences still need room to continue.
+    """
+    batch_size, gen_length = frame.generated_tokens.shape
+    device = frame.generated_tokens.device
+
+    next_frame = frame.apply_delta(delta, mask_token_id=mask_token_id)
+    full_block_mask = torch.zeros(
+        (batch_size, gen_length), dtype=torch.bool, device=device
+    )
+    full_block_mask[active_seq_idx] = block_mask
+    can_continue_block = check_can_generate(
+        next_frame,
+        eligible_mask=full_block_mask,
+        num_transfer_tokens=num_transfer_tokens,
+        stop_until_eos=stop_until_eos,
+        mask_token_id=mask_token_id,
+        eos_token_id=eos_token_id,
+    )
+    eos_seen = (
+        (next_frame.generated_tokens == eos_token_id).any(dim=-1)
+        if eos_token_id is not None
+        else torch.zeros(batch_size, dtype=torch.bool, device=device)
+    )
+    if torch.any(can_continue_block) or (stop_until_eos and torch.all(eos_seen)):
+        return delta
+
+    append_length = block_length
+    if max_new_tokens is not None:
+        append_length = min(block_length, max_new_tokens - gen_length)
+        if append_length <= 0:
+            return delta
+
+    full_decoded_tokens = torch.full(
+        (batch_size, gen_length),
+        INVALID_TOKEN_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    full_decoded_tokens[active_seq_idx] = delta.decoded_tokens
+    full_decoded_tokens = F.pad(
+        full_decoded_tokens, (0, append_length), value=mask_token_id
+    )
+
+    full_confidence = full_probs = None
+    if delta.confidence is not None:
+        full_confidence = torch.full(
+            (batch_size, gen_length),
+            -torch.inf,
+            dtype=delta.confidence.dtype,
+            device=device,
+        )
+        full_confidence[active_seq_idx] = delta.confidence
+        full_confidence = F.pad(full_confidence, (0, append_length), value=-torch.inf)
+
+    if delta.probs is not None:
+        full_probs = torch.full(
+            (batch_size, gen_length, delta.probs.size(-1)),
+            -torch.inf,
+            dtype=delta.probs.dtype,
+            device=device,
+        )
+        full_probs[active_seq_idx] = delta.probs
+        full_probs = F.pad(full_probs, (0, 0, 0, append_length), value=-torch.inf)
+
+    insert_index = torch.full(
+        (batch_size, append_length),
+        gen_length,
+        dtype=torch.long,
+        device=device,
+    )
+    insert_src_index = (
+        gen_length + torch.arange(append_length, dtype=torch.long, device=device)
+    ).expand(batch_size, -1)
+
+    return FrameDelta(
+        transfer_index=delta.transfer_index,
+        decoded_tokens=full_decoded_tokens,
+        confidence=full_confidence,
+        probs=full_probs,
+        intermediate=delta.intermediate,
+        insert_index=insert_index,
+        insert_src_index=insert_src_index,
+        extra=delta.extra,
+    )
 
 
 @torch.no_grad()
@@ -22,8 +125,10 @@ def generate_step(
     block_mask: torch.Tensor,
     num_transfer_tokens: int,
     unmasking_fn: Callable,
+    block_length: int,
+    max_new_tokens: int | None = None,
     attention_mask: torch.Tensor | None = None,
-    past_key_values: dCache | None = None,
+    cache: dCache | None = None,
     alg: str = "maskgit_plus",
     temperature: float = 0.0,
     top_p: float | None = None,
@@ -39,7 +144,66 @@ def generate_step(
 ) -> FrameDelta | None:
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
+    gen_length = frame.generated_tokens.size(1)
     device = block_mask.device
+    x_full = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)
+
+    is_blockd_cache = isinstance(cache, BlockdCache)
+    padding_attention_mask = (
+        attention_mask
+        if attention_mask is not None and attention_mask.dim() == 2
+        else None
+    )
+
+    if is_block_diffusion(model) and not is_blockd_cache:
+        block_ids = torch.arange(x_full.size(-1), device=device).div(
+            block_length, rounding_mode="floor"
+        )
+        attention_mask = (
+            (block_ids[:, None] >= block_ids[None, :])
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1, -1)
+        )
+        if padding_attention_mask is not None:
+            attention_mask = attention_mask & padding_attention_mask[
+                :, None, None, : x_full.size(-1)
+            ].bool()
+
+    if padding_attention_mask is not None:
+        position_ids = padding_attention_mask.cumsum(dim=-1) - 1
+        position_ids.masked_fill_(padding_attention_mask == 0, 0)
+    else:
+        position_ids = (
+            torch.arange(
+                x_full.size(-1),
+                dtype=torch.long,
+                device=device,
+            )
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+
+    if is_blockd_cache:
+        if cache.get_seq_length() == 0:
+            # cache prefilling
+            cache.active_seq_mask = torch.ones(
+                batch_size, dtype=torch.bool, device=device
+            )
+            cache.active_q_mask = F.pad(
+                torch.ones(batch_size, prompt_length, dtype=torch.bool, device=device),
+                (0, gen_length),
+                value=False,
+            )
+            model(
+                x_full,
+                attention_mask=padding_attention_mask,
+                position_ids=position_ids,
+                output_hidden_states=False,
+                past_key_values=cache,
+                use_cache=True,
+            )
+        cache.active_q_mask = F.pad(block_mask, (prompt_length, 0), value=False)
 
     can_generate = check_can_generate(
         frame,
@@ -56,38 +220,34 @@ def generate_step(
     remaining_mask = frame.generated_tokens == mask_token_id
     transfer_index_mask = remaining_mask.clone()
 
-    if past_key_values is not None:
-        past_key_values.active_seq_mask = can_generate
+    if cache is not None:
+        cache.active_seq_mask = can_generate
 
-    x = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)[active_seq_idx]
-    attention_mask = (
-        attention_mask[active_seq_idx] if attention_mask is not None else None
-    )
+    if attention_mask is not None and attention_mask.size(0) == batch_size:
+        attention_mask = attention_mask[active_seq_idx]
     block_mask = block_mask[active_seq_idx]
     outputs = model(
-        x,
+        x_full[active_seq_idx],
         attention_mask=attention_mask,
+        position_ids=position_ids[active_seq_idx],
         output_hidden_states=output_hidden_states,
-        past_key_values=past_key_values,
-        use_cache=past_key_values is not None,
+        past_key_values=cache,
+        use_cache=cache is not None,
     )
 
     logits = prepare_logits_for_generation(model, outputs.logits)
-    if past_key_values is not None and past_key_values.active_q_mask is not None:
-        if is_adapted_from_ar(model):
-            valid_mask = past_key_values.active_q_mask[:, prompt_length - 1 : -1]
+    if cache is not None and cache.active_q_mask is not None:
+        active_q_mask = cache.active_q_mask
+        if active_q_mask.size(0) == batch_size:
+            active_q_mask = active_q_mask[active_seq_idx]
+        if is_adapted_from_ar(model) and not is_blockd_cache:
+            valid_mask = active_q_mask[:, prompt_length - 1 : -1]
         else:
-            valid_mask = past_key_values.active_q_mask[:, prompt_length:]
-        transfer_index_mask[active_seq_idx].logical_and_(valid_mask)
+            valid_mask = active_q_mask[:, prompt_length:]
+        transfer_index_mask = transfer_index_mask[active_seq_idx] & valid_mask
+    else:
+        transfer_index_mask = transfer_index_mask[active_seq_idx]
     logits = logits[:, prompt_length:]
-    transfer_index_mask = transfer_index_mask[active_seq_idx]
-    remaining_mask = remaining_mask[active_seq_idx]
-
-    hidden_states = (
-        tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
-        if output_hidden_states
-        else None
-    )
 
     # sampling tokens for all generated positions
     confidence, x0, p = sample_tokens(
@@ -101,7 +261,9 @@ def generate_step(
     )
     scores = confidence = torch.where(transfer_index_mask, confidence, -torch.inf)
     if sigma is not None and sigma > 0:
-        scores = confidence * certainty_density(~remaining_mask, sigma=sigma)
+        scores = confidence * certainty_density(
+            ~remaining_mask[active_seq_idx], sigma=sigma
+        )
 
     # delegate token selection to strategy-specific unmasking logic
     transfer_index, extra = unmasking_fn(
@@ -123,7 +285,7 @@ def generate_step(
     for seq_idx, index in zip(active_seq_idx.tolist(), transfer_index):
         full_transfer_index[seq_idx] = index
 
-    return FrameDelta(
+    delta = FrameDelta(
         transfer_index=tuple(full_transfer_index),
         decoded_tokens=torch.where(transfer_index_mask, x0, INVALID_TOKEN_ID),
         confidence=confidence,
@@ -133,10 +295,28 @@ def generate_step(
             else None
         ),
         intermediate=Intermediate(
-            hidden_states=hidden_states if hidden_states is not None else tuple()
+            hidden_states=(
+                tuple((i, hs) for i, hs in enumerate(outputs.hidden_states))
+                if output_hidden_states
+                else tuple()
+            )
         ),
         extra=extra,
     )
+    if is_block_diffusion(model):
+        return maybe_extend_new_block(
+            frame,
+            delta,
+            block_length,
+            active_seq_idx=active_seq_idx,
+            block_mask=block_mask,
+            num_transfer_tokens=num_transfer_tokens,
+            stop_until_eos=stop_until_eos,
+            mask_token_id=mask_token_id,
+            eos_token_id=eos_token_id,
+            max_new_tokens=max_new_tokens,
+        )
+    return delta
 
 
 def confidence_unmasking(
@@ -158,7 +338,7 @@ def confidence_unmasking(
         token_probs: A tensor of shape [B, gen_length] containing the probabilities of each token.
         transfer_index_mask: A boolean tensor of shape [B, gen_length] indicating which tokens can be transferred.
         min_transfer_tokens: A tensor of shape [B,] indicating the minimum number of tokens to be transferred at each step.
-        max_transfer_tokens: Optional cap of shape [B,] for tokens transferred when threshold/factor select too many.
+        max_transfer_tokens: Maximum cap of shape [B,] for tokens transferred when threshold/factor select too many.
         threshold: A threshold for remasking. If provided, all tokens whose confidence is above this threshold will be kept.
         factor: factor-based parallel decoding factor, see https://arxiv.org/pdf/2505.22618.
         gamma: threshold of upper bound of joint dependence error, see https://arxiv.org/pdf/2505.24857.
@@ -273,17 +453,16 @@ def confidence_unmasking(
 def vanilla_generate(
     model,
     input_ids: torch.Tensor,
+    max_new_tokens: int | None,
     attention_mask: torch.Tensor | None = None,
     alg: str = "maskgit_plus",
     block_length: int = 32,
-    gen_length: int = 128,
     num_transfer_tokens: int = 1,
     temperature: float = 0.0,
     top_k: int | None = None,
     top_p: float | None = None,
     sigma: float | None = None,
-    mask_token_id: int | None = None,
-    pad_token_id: int | None = None,
+    mask_token_id: int = None,  # type: ignore
     eos_token_id: int | None = None,
     stop_until_eos: bool = False,
     # EB sampler
@@ -296,19 +475,18 @@ def vanilla_generate(
     factor: float | None = None,
     output_hidden_states: bool = False,
     output_probs: bool = False,
-    cache_cls: Type[dCache] | None = None,
+    cache: dCache | None = None,
 ) -> DecodeRecord:
     """
     Vanilla generation for diffusion large language models.
     Args:
         model: Mask predictor.
-        input_ids: A tensor of shape (B, prompt_len).
-        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-        gen_length: Generated answer length.
+        input_ids: Prompt token ids.
+        max_new_tokens: Maximum number of tokens to generate. If None, block diffusion decoding grows until EOS.
+        block_length: Block length, less than or equal to max_new_tokens. If less than max_new_tokens, it means using semi_autoregressive remasking.
         num_transfer_tokens: Minimum number of tokens to transfer per decoding step.
         temperature: Categorical distribution sampling temperature.
-        mask_token_id: The token id of [MASK]. It can be `None` if "MASK_TOKEN_ID" is specified in the environment variables.
-        pad_token_id: The token id of [PAD].
+        mask_token_id: The token id of [MASK].
         eos_token_id: The token id of [EOS]. It must be provided if stop_until_eos is set.
         top_k: The number of highest probability tokens to keep for one generation step.
         top_p: The cumulative probability threshold for nucleus sampling.
@@ -318,39 +496,23 @@ def vanilla_generate(
         output_hidden_states: Whether to return the hidden states of all decoded tokens from layers.
         output_probs: Whether to return the probs of all tokens.
     """
-
-    if mask_token_id is None and os.environ.get("MASK_TOKEN_ID", None) is None:
-        raise ValueError(
-            "mask_token_id must be provided either as an argument or an environment variable."
-        )
-    mask_token_id = mask_token_id or int(os.environ.get("MASK_TOKEN_ID"))  # type: ignore
+    assert isinstance(mask_token_id, int)
     if stop_until_eos:
-        if eos_token_id is None and os.environ.get("EOS_TOKEN_ID", None) is None:
-            raise ValueError(
-                "eos_token_id must be provided either as an argument or an environment variable if stop_until_eos is set to True."
-            )
-        eos_token_id = eos_token_id or int(os.environ.get("EOS_TOKEN_ID"))  # type: ignore
+        assert isinstance(eos_token_id, int)
+    if max_new_tokens is None:
+        assert stop_until_eos and isinstance(eos_token_id, int)
 
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-    if num_transfer_tokens <= 0:
-        raise ValueError(f"{num_transfer_tokens=} must be > 0")
-
+    block_aligned = is_block_diffusion(model)
     initial_frame = Frame.create_initial_frame(
         input_ids,
-        gen_length=gen_length,
+        num_new_tokens=get_initial_new_tokens(
+            input_ids.size(-1),
+            block_length,
+            max_new_tokens,
+            block_aligned=block_aligned,
+        ),
         mask_token_id=mask_token_id,
-    ).to(device=model.device, dtype=model.dtype)
-
-    if attention_mask is None and pad_token_id is not None:
-        attention_mask = (input_ids != pad_token_id).long()
-
-    if attention_mask is not None and attention_mask.shape == input_ids.shape:
-        attention_mask = F.pad(attention_mask, (0, gen_length), value=1).to(
-            model.device
-        )
-
-    cache = cache_cls(model.config) if cache_cls is not None else None
+    ).to(device=model.device, dtype=model.dtype).as_batch()
     frame = initial_frame
 
     def unmasking_fn(
@@ -376,33 +538,37 @@ def vanilla_generate(
         )
 
     deltas = []
+    block_idx = 0
 
-    for block_idx in range(num_blocks):
-        block_mask = torch.zeros(
-            (input_ids.size(0), gen_length),
-            dtype=torch.bool,
-            device=model.device,
+    while True:
+        block_mask = get_block_mask(
+            frame, block_idx, block_length, block_aligned=block_aligned
         )
-        block_mask[
-            :,
-            block_idx * block_length : (block_idx + 1) * block_length,
-        ] = True
+        if not torch.any(block_mask):
+            break
+        total_length = frame.prompts.size(-1) + frame.generated_tokens.size(-1)
+        if attention_mask is not None and attention_mask.size(-1) < total_length:
+            attention_mask = F.pad(
+                attention_mask, (0, total_length - attention_mask.size(-1)), value=1
+            )
 
         start_frame = frame.clone()
         if cache is not None:
-            cache.on_block_start(block_mask, frame)
+            cache.on_block_start(model, block_mask, frame)
         block_deltas = []
         while True:
             if cache is not None:
-                cache.on_step_start(block_mask, frame)
+                cache.on_step_start(model, block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
                 block_mask=block_mask,
                 num_transfer_tokens=num_transfer_tokens,
                 unmasking_fn=unmasking_fn,
+                block_length=block_length,
+                max_new_tokens=max_new_tokens,
                 attention_mask=attention_mask,
-                past_key_values=cache,
+                cache=cache,
                 alg=alg,
                 temperature=temperature,
                 top_p=top_p,
@@ -420,15 +586,20 @@ def vanilla_generate(
                 # if no more mask tokens are left, break the loop
                 break
             if cache is not None:
-                cache.on_step_end(block_mask, frame, delta)
+                cache.on_step_end(model, block_mask, frame, delta)
 
+            prev_length = frame.generated_tokens.size(-1)
             block_deltas.append(delta.to("cpu"))
-            frame = frame.apply_delta(delta)
+            frame = frame.apply_delta(delta, mask_token_id=mask_token_id)
+            # a new block is appended, break to start the next block
+            if frame.generated_tokens.size(-1) > prev_length:
+                break
 
         if cache is not None:
-            cache.on_block_end(block_mask, start_frame, block_deltas)
+            cache.on_block_end(model, block_mask, start_frame, block_deltas)
 
         deltas.extend(block_deltas)
+        block_idx += 1
 
     return DecodeRecord(
         initial_frame=initial_frame.to("cpu"),
