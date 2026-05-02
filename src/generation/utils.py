@@ -5,9 +5,62 @@ import torch.distributions as dists
 from src.frame import Frame
 from src.models.dream.generation_utils import top_k_logits, top_p_logits
 from src.third_party import get_token_freq
-from src.utils import is_adapted_from_ar, Registry
+from src.utils import Registry
 
 register = Registry()
+
+
+def get_initial_new_tokens(
+    prompt_length: int,
+    block_length: int,
+    max_new_tokens: int | None,
+    *,
+    block_aligned: bool,
+) -> int:
+    """
+    Return the number of masked tokens to place in the initial frame.
+
+    Standard diffusion decoders allocate the whole fixed generation budget at
+    once. Block diffusion decoders allocate only enough tokens to finish the
+    current global block, then append later blocks as decoding progresses.
+    """
+    if not block_aligned:
+        assert isinstance(max_new_tokens, int)
+        return max_new_tokens
+    first_block = (-prompt_length) % block_length or block_length
+    return first_block if max_new_tokens is None else min(first_block, max_new_tokens)
+
+
+def get_block_mask(
+    frame: Frame,
+    block_idx: int,
+    block_length: int,
+    *,
+    block_aligned: bool,
+) -> torch.Tensor:
+    """
+    Build a boolean mask selecting the generation positions for one decode block.
+
+    For ordinary diffusion decoding, blocks are counted from the generated
+    suffix. For block diffusion, blocks are counted over the full sequence so a
+    prompt ending mid-block produces a shorter first generated block.
+    """
+    frame = frame.as_batch()
+    batch_size, prompt_length = frame.prompts.shape
+    gen_length = frame.generated_tokens.size(-1)
+    device = frame.generated_tokens.device
+    if block_aligned:
+        block_mask = (
+            torch.arange(prompt_length, prompt_length + gen_length, device=device)
+            .div(block_length, rounding_mode="floor")
+            .eq(block_idx + prompt_length // block_length)
+        )
+    else:
+        start = block_idx * block_length
+        block_mask = torch.zeros(gen_length, dtype=torch.bool, device=device)
+        block_mask[start : start + block_length] = True
+    return block_mask.unsqueeze(0).expand(batch_size, -1).clone()
+
 
 def prepare_logits_for_generation(model, logits: torch.Tensor):
     """Prepare logits for unmasking."""
@@ -19,11 +72,10 @@ def prepare_logits_for_generation(model, logits: torch.Tensor):
         _token_freq = get_token_freq("llada", model.config.vocab_size)
     elif isinstance(model, DreamModel):
         _token_freq = get_token_freq("dream", model.config.vocab_size)
-    
-    if is_adapted_from_ar(model):
+
         # main difference with LLaDA, see https://github.com/DreamLM/Dream/issues/31
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
-    
+
     return logits
 
 
@@ -111,7 +163,7 @@ def sample_tokens(
         try:
             x0 = dists.Categorical(probs=probs).sample()
             confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
-        except:
+        except Exception:
             confidence, x0 = probs.max(dim=-1)
     else:
         confidence, x0 = probs.max(dim=-1)
@@ -177,8 +229,11 @@ def check_can_generate(
             (batch_size,), num_transfer_tokens, device=device, dtype=torch.long
         )
 
-    if eligible_mask is None:
-        eligible_mask = torch.ones_like(frame.generated_tokens)
+    eligible_mask = (
+        torch.ones_like(frame.generated_tokens)
+        if eligible_mask is None
+        else eligible_mask.clone()
+    )
 
     # condition 1
     if stop_until_eos:

@@ -13,7 +13,7 @@ The capabilities of large language models (LLMs) are widely regarded as relying 
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
 | `generation.num_transfer_tokens` | `int` | Minimum number of tokens transferred in each decoding step. |
-| `generation.gen_length` | `int` | The total length of the sequence to generate. |
+| `generation.max_new_tokens` | `int` | The maximum number of new tokens to generate. |
 | `generation.block_length` | `int` | The size of the block for semi-autoregressive decoding. |
 
 ### Example Usage
@@ -29,7 +29,7 @@ accelerate launch \
     seed=1234 \
     generation=vanilla \
     generation.num_transfer_tokens=1 \
-    generation.gen_length=256 \
+    generation.max_new_tokens=256 \
     generation.block_length=32 \
     model=llada-inst 
 ```
@@ -65,7 +65,7 @@ accelerate launch \
     seed=1234 \
     generation=vanilla \
     generation.num_transfer_tokens=1 \
-    generation.gen_length=256 \
+    generation.max_new_tokens=256 \
     generation.block_length=32 \
     generation.threshold=0.9 \
     model=llada-inst 
@@ -103,7 +103,7 @@ accelerate launch \
     seed=1234 \
     generation=pc_sampler \
     generation.num_transfer_tokens=1 \
-    generation.gen_length=256 \
+    generation.max_new_tokens=256 \
     generation.block_length=32 \
     generation.debias=true \
     model=llada-inst 
@@ -142,7 +142,7 @@ accelerate launch \
     seed=1234 \
     generation=vanilla \
     generation.num_transfer_tokens=1 \
-    generation.gen_length=256 \
+    generation.max_new_tokens=256 \
     generation.sigma=10 \
     model=llada-inst 
 ```

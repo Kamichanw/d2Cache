@@ -19,15 +19,15 @@
 # limitations under the License.
 """PyTorch Dream model."""
 
+from __future__ import annotations
+
 import math
-from typing import List, Optional, Tuple, Union
 import os
 import torch
 import torch.utils.checkpoint
 from torch import nn
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
     BaseModelOutput,
     MaskedLMOutput,
@@ -80,7 +80,7 @@ class DreamRotaryEmbedding(nn.Module):
         device=None,
         scaling_factor=1.0,
         rope_type="default",
-        config: Optional[DreamConfig] = None,
+        config: DreamConfig | None = None,
     ):
         super().__init__()
         # TODO (joao): remove the `if` below, only used for BC
@@ -301,19 +301,17 @@ class DreamAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_norm: nn.Module,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[dCache] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: dCache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # will become mandatory in v4.46
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        bsz, _, _ = hidden_states.size()
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         # create a dummy cache to simplify code
-        past_key_values = past_key_values or dCache(self.config)
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
 
         with past_key_values.attention(
             self.layer_idx,
@@ -325,15 +323,13 @@ class DreamAttention(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
         ) as ctx:
-            q_mismatch = ctx.q.shape != hidden_states.shape and (
-                ctx.q_position_ids is None
-                or ctx.q_position_ids.shape != ctx.q.shape[:2]
+            q_mismatch = ctx.q_position_ids is not None and ctx.q_position_ids.shape != (
+                ctx.q.size(0),
+                ctx.q.size(-2),
             )
-            kv_mismatch = (
-                ctx.k.shape != hidden_states.shape or ctx.v.shape != hidden_states.shape
-            ) and (
-                ctx.kv_position_ids is None
-                or ctx.kv_position_ids.shape != ctx.k.shape[:2]
+            kv_mismatch = ctx.kv_position_ids is not None and ctx.kv_position_ids.shape != (
+                ctx.k.size(0),
+                ctx.k.size(-2),
             )
             if q_mismatch or kv_mismatch:
                 raise ValueError(
@@ -341,13 +337,8 @@ class DreamAttention(nn.Module):
                     "the q, k, v must match the shape of corresponding position_ids."
                 )
 
-            q = ctx.q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            k = ctx.k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
-                1, 2
-            )
-            v = ctx.v.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
-                1, 2
-            )
+            bsz = ctx.q.size(0)
+            q, k, v = ctx.q, ctx.k, ctx.v
 
             cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
             k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
@@ -397,16 +388,14 @@ class DreamSdpaAttention(DreamAttention):
         self,
         hidden_states: torch.Tensor,
         attn_norm: nn.Module,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[dCache] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: dCache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # will become mandatory in v4.46
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -423,9 +412,9 @@ class DreamSdpaAttention(DreamAttention):
                 use_cache=use_cache,
             )
 
-        bsz, _, _ = hidden_states.size()
         # create a dummy cache to simplify code
-        past_key_values = past_key_values or dCache(self.config)
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
 
         with past_key_values.attention(
             self.layer_idx,
@@ -437,15 +426,13 @@ class DreamSdpaAttention(DreamAttention):
             attention_mask=attention_mask,
             position_ids=position_ids,
         ) as ctx:
-            q_mismatch = ctx.q.shape != hidden_states.shape and (
-                ctx.q_position_ids is None
-                or ctx.q_position_ids.shape != ctx.q.shape[:2]
+            q_mismatch = ctx.q_position_ids is not None and ctx.q_position_ids.shape != (
+                ctx.q.size(0),
+                ctx.q.size(-2),
             )
-            kv_mismatch = (
-                ctx.k.shape != hidden_states.shape or ctx.v.shape != hidden_states.shape
-            ) and (
-                ctx.kv_position_ids is None
-                or ctx.kv_position_ids.shape != ctx.k.shape[:2]
+            kv_mismatch = ctx.kv_position_ids is not None and ctx.kv_position_ids.shape != (
+                ctx.k.size(0),
+                ctx.k.size(-2),
             )
             if q_mismatch or kv_mismatch:
                 raise ValueError(
@@ -453,13 +440,8 @@ class DreamSdpaAttention(DreamAttention):
                     "the q, k, v must match the shape of corresponding position_ids."
                 )
 
-            q = ctx.q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            k = ctx.k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
-                1, 2
-            )
-            v = ctx.v.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
-                1, 2
-            )
+            bsz = ctx.q.size(0)
+            q, k, v = ctx.q, ctx.k, ctx.v
 
             cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
             k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
@@ -476,7 +458,7 @@ class DreamSdpaAttention(DreamAttention):
 
             # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
             # Reference: https://github.com/pytorch/pytorch/issues/112577.
-            if q.device.type == "cuda" and attention_mask is not None:
+            if q.device.type == "cuda" and ctx.attention_mask is not None:
                 q = q.contiguous()
                 k = k.contiguous()
                 v = v.contiguous()
@@ -538,15 +520,13 @@ class DreamDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[dCache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # will become mandatory in v4.46
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: dCache | None = None,
+        output_attentions: bool | None = False,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
         **kwargs,
     ):
         """
@@ -563,15 +543,16 @@ class DreamDecoderLayer(nn.Module):
             past_key_values (`dCache`, *optional*): cached past key and value projection states
             cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
                 Indices depicting the position of the input sequence tokens in the sequence.
-            position_embeddings (`Tuple[torch.Tensor, torch.Tensor]`, *optional*):
-                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
+            position_embeddings (`tuple[torch.Tensor, torch.Tensor]`, *optional*):
+                tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
             kwargs (`dict`, *optional*):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
         # create a dummy cache to simplify code
-        past_key_values = past_key_values or dCache(self.config)
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
 
         # Self Attention
         hidden_states, self_attn_weights, residual = self.self_attn(
@@ -633,16 +614,16 @@ class DreamPreTrainedModel(PreTrainedModel):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+        pretrained_model_name_or_path: str | os.PathLike | None,
         *model_args,
-        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
-        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        config: PretrainedConfig | str | os.PathLike | None = None,
+        cache_dir: str | os.PathLike | None = None,
         ignore_mismatched_sizes: bool = False,
         force_download: bool = False,
         local_files_only: bool = False,
-        token: Optional[Union[str, bool]] = None,
+        token: str | bool | None = None,
         revision: str = "main",
-        use_safetensors: Optional[bool] = None,
+        use_safetensors: bool | None = None,
         weights_only: bool = True,
         **kwargs,
     ):
@@ -722,17 +703,17 @@ class DreamBaseModel(DreamPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[dCache] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutput]:
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: dCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+    ) -> tuple | BaseModelOutput:
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -745,7 +726,8 @@ class DreamBaseModel(DreamPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         # create a dummy cache to simplify code
-        past_key_values = past_key_values or dCache(self.config)
+        if past_key_values is None:
+            past_key_values = dCache(self.config)
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
@@ -881,20 +863,20 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[dCache] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: dCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         num_logits_to_keep: int = 0,
         **loss_kwargs,
-    ) -> Union[Tuple, MaskedLMOutput]:
+    ) -> tuple | MaskedLMOutput:
         output_attentions = (
             output_attentions
             if output_attentions is not None

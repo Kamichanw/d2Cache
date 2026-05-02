@@ -157,7 +157,7 @@ class Timer:
                     total_tokens += sum(t.numel() for t in new_tokens)
                 elif isinstance(new_tokens, torch.Tensor):
                     total_tokens += new_tokens.numel()
-            return total_tokens / record.num_steps
+            return total_tokens / len(record.deltas)
 
 
 class LoggerFilter:

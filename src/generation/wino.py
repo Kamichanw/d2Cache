@@ -1,16 +1,18 @@
-import os
 import torch
 import torch.nn.functional as F
 
+from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import (
     check_can_generate,
+    get_block_mask,
+    get_initial_new_tokens,
     prepare_logits_for_generation,
     register,
     sample_tokens,
 )
-from src.generation.vanilla import confidence_unmasking
-from src.utils import certainty_density
+from src.generation.vanilla import confidence_unmasking, maybe_extend_new_block
+from src.utils import certainty_density, is_block_diffusion
 
 
 @torch.no_grad()
@@ -20,6 +22,7 @@ def wino_generate_step(
     block_mask: torch.Tensor,
     attention_mask: torch.Tensor,
     num_transfer_tokens: int = 1,
+    max_new_tokens: int | None = None,
     alg: str = "maskgit_plus",
     temperature: float = 0.0,
     top_p: float | None = None,
@@ -35,16 +38,24 @@ def wino_generate_step(
     wide_in_thres: float = 0.6,
     narrow_out_thres: float = 0.9,
     num_last_wide_in: torch.Tensor = None,  # type: ignore
+    generation_block_length: int | None = None,
     output_hidden_states: bool = False,
     output_probs: bool = False,
 ) -> FrameDelta | None:
+    """
+    Run one Wino decoding step with a temporary shadow block.
+
+    The shadow block is used only for leave-one-out confidence estimation, so it
+    is forwarded without KV caching and never becomes part of the committed frame.
+    """
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
     device = frame.prompts.device
     block_indices = torch.nonzero(block_mask[0], as_tuple=False).squeeze(-1)
     block_start = block_indices[0].item()
     block_end = block_indices[-1].item() + 1
-    block_length = int(block_end - block_start)
+    block_width = int(block_end - block_start)
+    generation_block_length = generation_block_length or block_width
 
     can_generate = check_can_generate(
         frame,
@@ -68,7 +79,7 @@ def wino_generate_step(
     # append a block of mask_token_id to input ids
     x = F.pad(
         torch.cat([prompts_active, generated_active], dim=-1),
-        (0, block_length),
+        (0, block_width),
         value=mask_token_id,
     )
 
@@ -77,34 +88,51 @@ def wino_generate_step(
 
     # prepare attention mask & position ids
     # see figure 2(b) of the original paper for details
-    active_attn_mask_ext = F.pad(active_attn_mask, (0, block_length), value=1)
+    active_attn_mask_ext = F.pad(active_attn_mask, (0, block_width), value=1)
 
     prefix_pos_ids = (torch.cumsum(active_attn_mask, dim=1) - 1) * active_attn_mask
     position_ids = torch.zeros(
         (active_batch_size, total_len), device=device, dtype=torch.long
     )
-    position_ids[:, :-block_length] = prefix_pos_ids
-    position_ids[:, -block_length:] = prefix_pos_ids[
+    position_ids[:, :-block_width] = prefix_pos_ids
+    position_ids[:, -block_width:] = prefix_pos_ids[
         :, prompt_length + block_start : prompt_length + block_end
     ]
 
-    final_mask = (
-        active_attn_mask_ext.unsqueeze(1)
-        .unsqueeze(1)
-        .expand(-1, 1, total_len, total_len)
-        .bool()
-        .clone()
-    )
+    if is_block_diffusion(model):
+        main_positions = torch.arange(total_len - block_width, device=device)
+        shadow_positions = prompt_length + torch.arange(
+            block_start, block_end, device=device
+        )
+        block_ids = torch.cat([main_positions, shadow_positions]).div(
+            generation_block_length, rounding_mode="floor"
+        )
+        final_mask = (
+            (block_ids[:, None] >= block_ids[None, :])
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .expand(active_batch_size, -1, -1, -1)
+            .clone()
+        )
+        final_mask &= active_attn_mask_ext[:, None, None, :].bool()
+    else:
+        final_mask = (
+            active_attn_mask_ext.unsqueeze(1)
+            .unsqueeze(1)
+            .expand(-1, 1, total_len, total_len)
+            .bool()
+            .clone()
+        )
 
     # ----- apply wino mask constraints -----
     # nothing attends to shadow block (except shadow block itself)
-    final_mask[:, :, :-block_length, -block_length:] = False
+    final_mask[:, :, :-block_width, -block_width:] = False
 
     # shadow block attends to current block with ~eye (leave-one-out)
-    r_start = total_len - block_length
+    r_start = total_len - block_width
     c_start = prompt_length + block_start
-    final_mask[:, :, r_start:, c_start : c_start + block_length] &= ~torch.eye(
-        block_length, device=device, dtype=torch.bool
+    final_mask[:, :, r_start:, c_start : c_start + block_width] &= ~torch.eye(
+        block_width, device=device, dtype=torch.bool
     )
 
     # ----- forward with the shadow block -----
@@ -123,7 +151,7 @@ def wino_generate_step(
     combined_logits = torch.where(
         block_mask_curr.unsqueeze(-1),
         logits[:, prompt_length + block_start : prompt_length + block_end],
-        logits[:, -block_length:],
+        logits[:, -block_width:],
     ).to(torch.float64)
 
     hidden_states = (
@@ -269,7 +297,7 @@ def wino_generate_step(
         dummy_probs[mask_token_id] = 1.0
         probs_ext[remask_mask] = dummy_probs.unsqueeze(0)
 
-    return FrameDelta(
+    delta = FrameDelta(
         transfer_index=transfer_index,
         decoded_tokens=decoded_tokens,
         confidence=confidence_ext,
@@ -279,23 +307,37 @@ def wino_generate_step(
         ),
         extra=dict(num_last_wide_in=num_last_wide_in),
     ).to(model.dtype)
+    if is_block_diffusion(model):
+        active_seq_idx = torch.nonzero(can_generate, as_tuple=True)[0]
+        return maybe_extend_new_block(
+            frame,
+            delta,
+            generation_block_length,
+            active_seq_idx=active_seq_idx,
+            block_mask=block_mask[can_generate],
+            num_transfer_tokens=num_transfer_tokens,
+            stop_until_eos=stop_until_eos,
+            mask_token_id=mask_token_id,
+            eos_token_id=eos_token_id,
+            max_new_tokens=max_new_tokens,
+        )
+    return delta
 
 
 @register("wino")
 def wino_generate(
     model,
     input_ids: torch.Tensor,
+    max_new_tokens: int | None,
     attention_mask: torch.Tensor | None = None,
     alg: str = "maskgit_plus",
     block_length: int = 32,
-    gen_length: int = 128,
     num_transfer_tokens: int = 1,
     temperature: float = 0.0,
     top_k: int | None = None,
     top_p: float | None = None,
     sigma: float | None = None,
-    mask_token_id: int | None = None,
-    pad_token_id: int | None = None,
+    mask_token_id: int = None,  # type: ignore
     eos_token_id: int | None = None,
     stop_until_eos: bool = False,
     # wino
@@ -303,67 +345,69 @@ def wino_generate(
     narrow_out_thres: float = 0.9,
     output_hidden_states: bool = False,
     output_probs: bool = False,
+    cache: dCache | None = None,
 ) -> DecodeRecord:
     """
     Wino decoding strategy.
     """
-    mask_token_id = mask_token_id or int(os.environ.get("MASK_TOKEN_ID", -1))
-    pad_token_id = pad_token_id or int(os.environ.get("PAD_TOKEN_ID", -1))
-
-    if -1 in [mask_token_id, pad_token_id]:
-        raise ValueError(
-            "mask_token_id and pad_token_id must be provided either as arguments or environment variables."
-        )
+    assert isinstance(mask_token_id, int)
     if stop_until_eos:
-        if eos_token_id is None and os.environ.get("EOS_TOKEN_ID", None) is None:
-            raise ValueError(
-                "eos_token_id must be provided either as an argument or an environment variable if stop_until_eos is set to True."
-            )
-        eos_token_id = eos_token_id or int(os.environ.get("EOS_TOKEN_ID"))  # type: ignore
+        assert isinstance(eos_token_id, int)
+    assert attention_mask is not None
+    if max_new_tokens is None:
+        assert stop_until_eos and isinstance(eos_token_id, int)
 
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-    if num_transfer_tokens <= 0:
-        raise ValueError(f"{num_transfer_tokens=} must be > 0")
-
+    block_aligned = is_block_diffusion(model)
     initial_frame = Frame.create_initial_frame(
         input_ids,
-        gen_length=gen_length,
+        num_new_tokens=get_initial_new_tokens(
+            input_ids.size(-1),
+            block_length,
+            max_new_tokens,
+            block_aligned=block_aligned,
+        ),
         mask_token_id=mask_token_id,
     ).to(device=model.device, dtype=model.dtype)
-
-    if attention_mask is None:
-        attention_mask = (input_ids != pad_token_id).long()
-
-    if attention_mask.shape == input_ids.shape:
-        attention_mask = F.pad(attention_mask, (0, gen_length), value=1).to(
-            model.device
-        )
+    initial_frame = initial_frame.as_batch()
+    batch_size = initial_frame.generated_tokens.size(0)
+    attention_mask = attention_mask.to(model.device)
 
     frame = initial_frame
     deltas = []
 
-    for block_idx in range(num_blocks):
-        num_last_wide_in = torch.full(
-            (input_ids.size(0),), 30, device=model.device, dtype=torch.long
+    block_idx = 0
+    while True:
+        block_mask = get_block_mask(
+            frame, block_idx, block_length, block_aligned=block_aligned
         )
-        block_mask = torch.zeros(
-            (input_ids.size(0), gen_length),
-            dtype=torch.bool,
-            device=model.device,
-        )
-        block_mask[
-            :,
-            block_idx * block_length : (block_idx + 1) * block_length,
-        ] = True
+        if not torch.any(block_mask):
+            break
+        total_length = frame.prompts.size(-1) + frame.generated_tokens.size(-1)
+        if attention_mask.size(-1) < total_length:
+            attention_mask = F.pad(
+                attention_mask,
+                (0, total_length - attention_mask.size(-1)),
+                value=1,
+            )
 
+        num_last_wide_in = torch.full(
+            (batch_size,), 30, device=model.device, dtype=torch.long
+        )
+
+        start_frame = frame.clone()
+        if cache is not None:
+            cache.on_block_start(model, block_mask, frame)
+        block_deltas = []
         while True:
+            if cache is not None:
+                cache.on_step_start(model, block_mask, frame)
             delta = wino_generate_step(
                 model=model,
                 frame=frame,
                 block_mask=block_mask,
                 attention_mask=attention_mask,
                 num_transfer_tokens=num_transfer_tokens,
+                max_new_tokens=max_new_tokens,
                 alg=alg,
                 temperature=temperature,
                 top_p=top_p,
@@ -375,6 +419,7 @@ def wino_generate(
                 wide_in_thres=wide_in_thres,
                 narrow_out_thres=narrow_out_thres,
                 num_last_wide_in=num_last_wide_in,
+                generation_block_length=block_length,
                 output_hidden_states=output_hidden_states,
                 output_probs=output_probs,
             )
@@ -382,11 +427,23 @@ def wino_generate(
             if delta is None:
                 break
 
+            if cache is not None:
+                cache.on_step_end(model, block_mask, frame, delta)
+
             # update num_last_wide_in based on Wide In count
             num_last_wide_in = delta.extra.pop("num_last_wide_in")
 
-            deltas.append(delta.to("cpu"))
-            frame = frame.apply_delta(delta)
+            prev_length = frame.generated_tokens.size(-1)
+            block_deltas.append(delta.to("cpu"))
+            frame = frame.apply_delta(delta, mask_token_id=mask_token_id)
+            if frame.generated_tokens.size(-1) > prev_length:
+                break
+
+        if cache is not None:
+            cache.on_block_end(model, block_mask, start_frame, block_deltas)
+
+        deltas.extend(block_deltas)
+        block_idx += 1
 
     return DecodeRecord(
         initial_frame=initial_frame.to("cpu"),

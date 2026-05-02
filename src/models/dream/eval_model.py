@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 import torch.amp
 
-from typing import List
 from loguru import logger
 from omegaconf import DictConfig
 from lm_eval.api.instance import Instance
@@ -289,6 +288,6 @@ class DreamEval(EvalMDLM):
         return out
 
     def loglikelihood_rolling(
-        self, requests: List[Instance], disable_tqdm: bool = False
-    ) -> List[float]:
+        self, requests: list[Instance], disable_tqdm: bool = False
+    ) -> list[float]:
         raise NotImplementedError

@@ -9,27 +9,33 @@ def load_pretrained_model(cfg: DictConfig, **model_kwargs) -> PreTrainedModel:
     """
     Load a pretrained model based on the configuration.
     """
-    from ..models import LLaDAModelLM, DreamModel
+    from ..models import LLaDAModelLM, DreamModel, SDARForCausalLM
 
     model_family = cfg.model.name.split("-")[0]
     if model_family == "llada":
         model = LLaDAModelLM.from_pretrained(cfg.model.path, **model_kwargs)
     elif model_family == "dream":
-        model = DreamModel.from_pretrained(cfg.model.path, **model_kwargs)
+        return DreamModel.from_pretrained(cfg.model.path, **model_kwargs)
+    elif model_family == "sdar":
+        return SDARForCausalLM.from_pretrained(cfg.model.path, **model_kwargs)
     else:
-        raise ValueError(f"Unsupported pretrained model: {cfg.model.name}")
+        raise NotImplementedError(
+            f"Model family {model_family} is not implemented for loading."
+        )
 
     return model
 
 
 def load_eval_model(cfg: DictConfig, **model_kwargs):
-    from ..models import LLaDAEval, DreamEval
+    from ..models import LLaDAEval, DreamEval, SDAREval
 
     model_family = cfg.model.name.split("-")[0]
     if model_family == "llada":
         eval_model = LLaDAEval(cfg, **model_kwargs)
     elif model_family == "dream":
         eval_model = DreamEval(cfg, **model_kwargs)
+    elif model_family == "sdar":
+        eval_model = SDAREval(cfg, **model_kwargs)
     else:
         raise NotImplementedError(
             f"Model family {model_family} is not implemented for evaluation."
@@ -98,5 +104,25 @@ def is_adapted_from_ar(
         return False
     elif config.model_type.lower() == "dream":
         return True
+    elif config.model_type.lower() == "sdar":
+        return True
     else:
         raise ValueError(f"Unsupported model type: {config.model_type}")
+
+
+def is_block_diffusion(
+    model_or_config: PreTrainedModel | PretrainedConfig,
+) -> bool:
+    """
+    Check whether a model uses block diffusion decoding semantics.
+    """
+    if isinstance(model_or_config, PreTrainedModel):
+        config = model_or_config.config
+    elif isinstance(model_or_config, PretrainedConfig):
+        config = model_or_config
+    else:
+        raise ValueError(
+            f"Expected model_or_config to be an instance of PreTrainedModel or PretrainedConfig, but got {type(model_or_config)}"
+        )
+
+    return config.model_type.lower() == "sdar"

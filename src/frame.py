@@ -271,9 +271,9 @@ class FrameDelta(Base):
 
             if self.decoded_tokens.dim() != 2:
                 raise ValueError("decoded_tokens must be 2D for a batched delta.")
-            if self.decoded_tokens.size(0) != active_batch_size:
+            if self.decoded_tokens.size(0) not in {active_batch_size, batch_size}:
                 raise ValueError(
-                    f"decoded_tokens batch size ({self.decoded_tokens.size(0)}) must match active sequence count ({active_batch_size})."
+                    f"decoded_tokens batch size ({self.decoded_tokens.size(0)}) must match active sequence count ({active_batch_size}) or batch size ({batch_size})."
                 )
 
             if (
@@ -302,9 +302,9 @@ class FrameDelta(Base):
                         raise ValueError(
                             f"'{name}' must be a 2D tensor for a batched delta."
                         )
-                    if field.size(0) != active_batch_size:
+                    if field.size(0) not in {active_batch_size, batch_size}:
                         raise ValueError(
-                            f"The first dimension of '{name}' ({field.size(0)}) must match active sequence count ({active_batch_size})."
+                            f"The first dimension of '{name}' ({field.size(0)}) must match active sequence count ({active_batch_size}) or batch size ({batch_size})."
                         )
         else:
             transfer_index = cast(torch.Tensor, self.transfer_index)
@@ -342,9 +342,7 @@ class FrameDelta(Base):
             if self.insert_index is not None and self.insert_index.dim() != 1:
                 raise ValueError("insert_index must be 1D for a non-batched delta.")
             if self.insert_src_index is not None and self.insert_src_index.dim() != 1:
-                raise ValueError(
-                    "insert_src_index must be 1D for a non-batched delta."
-                )
+                raise ValueError("insert_src_index must be 1D for a non-batched delta.")
             if self.delete_index is not None and self.delete_index.dim() != 1:
                 raise ValueError("delete_index must be 1D for a non-batched delta.")
         return self
@@ -362,11 +360,13 @@ class FrameDelta(Base):
 
         return FrameDelta(
             transfer_index=(transfer_index,),
-            transfer_src_index=(transfer_src_index,)
-            if transfer_src_index is not None
-            else None,
+            transfer_src_index=(
+                (transfer_src_index,) if transfer_src_index is not None else None
+            ),
             insert_index=(
-                self.insert_index.unsqueeze(0) if self.insert_index is not None else None
+                self.insert_index.unsqueeze(0)
+                if self.insert_index is not None
+                else None
             ),
             insert_src_index=(
                 self.insert_src_index.unsqueeze(0)
@@ -374,7 +374,9 @@ class FrameDelta(Base):
                 else None
             ),
             delete_index=(
-                self.delete_index.unsqueeze(0) if self.delete_index is not None else None
+                self.delete_index.unsqueeze(0)
+                if self.delete_index is not None
+                else None
             ),
             decoded_tokens=self.decoded_tokens.unsqueeze(0),
             confidence=(
@@ -398,6 +400,15 @@ class FrameDelta(Base):
             else self.transfer_index
         )
         if self.is_batched:
+            if self.decoded_tokens.size(0) == len(transfer_src_index):
+                return tuple(
+                    (
+                        self.decoded_tokens[row, index]
+                        if index.numel() > 0
+                        else torch.tensor([], dtype=torch.long, device=index.device)
+                    )
+                    for row, index in enumerate(transfer_src_index)
+                )
             decoded_tokens_iter = iter(self.decoded_tokens)
             return tuple(
                 (
@@ -611,7 +622,10 @@ class Frame(Base):
 
     @classmethod
     def create_initial_frame(
-        cls, prompts: torch.Tensor, gen_length: int, mask_token_id: int | None = None
+        cls,
+        prompts: torch.Tensor,
+        num_new_tokens: int,
+        mask_token_id: int | None = None,
     ) -> "Frame":
         try:
             mask_token_id = mask_token_id or int(os.environ["MASK_TOKEN_ID"])
@@ -624,19 +638,19 @@ class Frame(Base):
         frame = cls(
             prompts=batched_prompts,
             generated_tokens=torch.full(
-                (batched_prompts.size(0), gen_length),
+                (batched_prompts.size(0), num_new_tokens),
                 mask_token_id,
                 dtype=torch.long,
                 device=prompts.device,
             ),
             confidence=torch.full(
-                (batched_prompts.size(0), gen_length),
+                (batched_prompts.size(0), num_new_tokens),
                 -torch.inf,
                 dtype=torch.float32,
                 device=prompts.device,
             ),
             steps=torch.full(
-                (batched_prompts.size(0), gen_length),
+                (batched_prompts.size(0), num_new_tokens),
                 PLACEHOLDER_STEP,
                 dtype=torch.long,
                 device=prompts.device,
@@ -655,13 +669,6 @@ class Frame(Base):
 
         delta = delta.as_batch()
         batch_size, device = len(delta.transfer_index), delta.decoded_tokens.device
-        try:
-            mask_token_id = mask_token_id or int(os.environ["MASK_TOKEN_ID"])
-        except KeyError:
-            raise ValueError(
-                "mask_token_id must be provided either as an argument or an environment variable."
-            )
-
         # 1. apply transferring
         new_frame = self.clone().as_batch().to(device=device)
 
@@ -680,11 +687,18 @@ class Frame(Base):
         new_frame.steps[row_indices, col_indices] = next_steps + 1
         new_frame.generated_tokens[row_indices, col_indices] = torch.cat(delta.transferred_tokens)  # type: ignore
 
-        if delta.confidence is not None and new_frame.confidence is not None:
-            active_row_indices = torch.repeat_interleave(
-                torch.arange(delta.decoded_tokens.size(0), device=device),
-                repeats=lengths[lengths > 0],
-            )
+        if (
+            delta.confidence is not None
+            and new_frame.confidence is not None
+            and col_indices.numel() > 0
+        ):
+            if delta.confidence.size(0) == batch_size:
+                active_row_indices = row_indices
+            else:
+                active_row_indices = torch.repeat_interleave(
+                    torch.arange(delta.confidence.size(0), device=device),
+                    repeats=lengths[lengths > 0],
+                )
             transfer_src_index = (
                 delta.transfer_src_index
                 if delta.transfer_src_index is not None
@@ -698,9 +712,6 @@ class Frame(Base):
             ]
 
         # 2. perform insertion
-        active_mask = torch.tensor(
-            [t.numel() > 0 for t in delta.transfer_index], device=device
-        )
         if delta.insert_index is not None or delta.insert_src_index is not None:
             if (
                 delta.insert_index is None
@@ -711,20 +722,38 @@ class Frame(Base):
                     "The insert index and insert source index must both be specified and have the same shape."
                 )
             _, K = delta.insert_index.shape
-
+            insert_active_mask = (
+                torch.ones(batch_size, dtype=torch.bool, device=device)
+                if delta.insert_index.size(0) == batch_size
+                else torch.tensor(
+                    [t.numel() > 0 for t in delta.transfer_index], device=device
+                )
+            )
+            try:
+                mask_token_id = mask_token_id or int(os.environ["MASK_TOKEN_ID"])
+            except (KeyError, ValueError):
+                pass
+            if mask_token_id is None:
+                raise ValueError(
+                    "mask_token_id must be provided either as an argument or an environment variable when applying an insertion delta."
+                )
             # upsample delta data to full batch size
-            expand_active_mask = active_mask.unsqueeze(1).expand(-1, K)
+            expand_active_mask = insert_active_mask.unsqueeze(1).expand(-1, K)
             full_insert_index = torch.zeros(
                 batch_size, K, dtype=torch.long, device=device
             ).masked_scatter_(expand_active_mask, delta.insert_index)
             full_insert_tokens = torch.full(
-                (batch_size, K), mask_token_id, dtype=torch.long, device=device
+                (batch_size, K),
+                mask_token_id if mask_token_id is not None else 0,
+                dtype=torch.long,
+                device=device,
             ).masked_scatter_(expand_active_mask, delta.inserted_tokens)
+            # only update steps for non-mask tokens, as mask tokens will be replaced in the future
             full_insert_steps = torch.full(
                 (batch_size, K), PLACEHOLDER_STEP, dtype=torch.long, device=device
             ).masked_scatter_(
-                expand_active_mask,
-                (new_frame.current_steps[active_mask, None] + 1).expand(-1, K),  # type: ignore
+                expand_active_mask & delta.inserted_tokens.ne(mask_token_id),
+                (new_frame.current_steps[insert_active_mask, None] + 1).expand(-1, K),  # type: ignore
             )
             full_insert_conf = None
             if delta.confidence is not None:
@@ -843,22 +872,8 @@ class DecodeRecord(Base, Sequence):
             frames.append(frames[-1].apply_delta(delta))
         return frames
 
-    @property
-    def num_steps(self) -> int:
-        """
-        Returns the number of steps in generation.
-        """
-        return len(self.deltas)
-
-    @property
-    def gen_length(self) -> int:
-        """
-        Returns the length of the generated sequence.
-        """
-        return self.initial_frame.generated_tokens.size(-1)
-
     def __len__(self) -> int:
-        return 1 + self.num_steps  # +1 for the initial frame
+        return 1 + len(self.deltas)  # +1 for the initial frame
 
     @overload
     def __getitem__(self, index: int) -> Frame: ...
@@ -896,4 +911,4 @@ class DecodeRecord(Base, Sequence):
             )
 
     def __repr__(self) -> str:
-        return f"DecodeRecord(gen_length={self.gen_length}, block_length={self.block_length}, len={len(self)})"
+        return f"DecodeRecord(block_length={self.block_length}, len={len(self)})"

@@ -5,7 +5,7 @@ strategy: ar
 threshold: null # all tokens whose confidence is above this threshold will be fixed
 
 alg: "maskgit_plus"
-gen_length: null
+max_new_tokens: null
 block_length: null
 num_transfer_tokens: 1
 temperature: 0.0
