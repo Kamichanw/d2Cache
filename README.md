@@ -39,7 +39,9 @@ Codebase for Diffusion Language Models Research
 
 [25/10/13] Now, batch inference is supported!
 
-[25/12/06] 🚀 We are looking for help to reproduce our experimental results using A100 GPUs. Please contact us if you can assist with the benchmarking.
+[25/12/6] 🚀 We are looking for help to reproduce our experimental results using A100 GPUs. Please contact us if you can assist with the benchmarking.
+
+[26/5/2] We now support SDAR series models, more block diffusion dLLMs will be added in the future!
 
 # Supported Models & Methods
 ## Models
@@ -49,6 +51,7 @@ The following models are supported out-of-the-box:
 | LLaDA-8B (`llada-base`, `llada-inst`) | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
 | LLaDA-1.5 (`llada-1.5`) | <a href="https://arxiv.org/abs/2505.19223"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2505.19223-red"></a> | <a href="https://github.com/ML-GSAI/LLaDA-1.5"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA-1.5?style=social&label=Stars"></a> |
 | Dream-v0-7B (`dream-base`, `dream-inst`) | <a href="https://arxiv.org/abs/2508.15487"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.15487-red"></a> | <a href="https://github.com/DreamLM/Dream"><img alt="Static Badge" src="https://img.shields.io/github/stars/DreamLM/Dream?style=social&label=Stars"></a> |
+| SDAR-8B (`sdar-8b-chat`) | <a href="https://arxiv.org/abs/2510.06303"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2510.06303-red"></a> | <a href="https://github.com/JetAstra/SDAR"><img alt="Static Badge" src="https://img.shields.io/github/stars/JetAstra/SDAR?style=social&label=Stars"></a> |
 
 ## KV Caching
 The corresponding usages can be found [here](./docs/kv_caching.md).
@@ -58,6 +61,7 @@ The corresponding usages can be found [here](./docs/kv_caching.md).
 | PrefixCache / DualCache | <a href="https://arxiv.org/abs/2505.22618 "> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2505.22618-58C9ED"> </a> | <a href="https://github.com/NVLabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
 | dLLM Cache | <a href="https://arxiv.org/abs/2506.06295"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2506.06295-red"></a> | <a href="https://github.com/maomaocun/dLLM-Cache"><img alt="Static Badge" src="https://img.shields.io/github/stars/maomaocun/dLLM-Cache?style=social&label=Stars"></a> |
 | d2Cache | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2509.23094-58C9ED"> </a> | This Repo |
+| BlockDiffusion Cache | <a href="https://arxiv.org/abs/2510.06303"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2510.06303-red"></a> | <a href="https://github.com/JetAstra/SDAR"><img alt="Static Badge" src="https://img.shields.io/github/stars/JetAstra/SDAR?style=social&label=Stars"></a> |
 
 ## Decoding Strategies
 The corresponding usages can be found [here](./docs/decoding_strategies.md).
@@ -97,6 +101,7 @@ Available models:
 - llada-1.5: GSAI-ML/LLaDA-1.5
 - dream-base: Dream-org/Dream-v0-Base-7B
 - dream-inst: Dream-org/Dream-v0-Instruct-7B
+- sdar-8b-chat: JetAstra/SDAR-8B-Chat
 
 Available datasets:
 - gsm8k

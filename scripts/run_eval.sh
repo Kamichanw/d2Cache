@@ -9,5 +9,4 @@ accelerate launch \
     batch_size=1 \
     seed=1234 \
     generation=vanilla \
-    generation.stop_until_eos=true \
-    model=sdar-8b-chat 
+    model=llada-inst 
