@@ -729,14 +729,14 @@ class Frame(Base):
                     [t.numel() > 0 for t in delta.transfer_index], device=device
                 )
             )
-            if not torch.all(insert_active_mask):
-                try:
-                    if mask_token_id is None:
-                        mask_token_id = int(os.environ["MASK_TOKEN_ID"])
-                except KeyError:
-                    raise ValueError(
-                        "mask_token_id must be provided either as an argument or an environment variable when applying an insertion delta."
-                    )
+            try:
+                mask_token_id = mask_token_id or int(os.environ["MASK_TOKEN_ID"])
+            except (KeyError, ValueError):
+                pass
+            if mask_token_id is None:
+                raise ValueError(
+                    "mask_token_id must be provided either as an argument or an environment variable when applying an insertion delta."
+                )
             # upsample delta data to full batch size
             expand_active_mask = insert_active_mask.unsqueeze(1).expand(-1, K)
             full_insert_index = torch.zeros(
@@ -748,16 +748,11 @@ class Frame(Base):
                 dtype=torch.long,
                 device=device,
             ).masked_scatter_(expand_active_mask, delta.inserted_tokens)
-            update_step_mask = expand_active_mask
-            if mask_token_id is not None:
-                update_step_mask = update_step_mask & delta.inserted_tokens.ne(
-                    mask_token_id
-                )
             # only update steps for non-mask tokens, as mask tokens will be replaced in the future
             full_insert_steps = torch.full(
                 (batch_size, K), PLACEHOLDER_STEP, dtype=torch.long, device=device
             ).masked_scatter_(
-                update_step_mask,
+                expand_active_mask & delta.inserted_tokens.ne(mask_token_id),
                 (new_frame.current_steps[insert_active_mask, None] + 1).expand(-1, K),  # type: ignore
             )
             full_insert_conf = None

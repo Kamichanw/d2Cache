@@ -180,6 +180,8 @@ def forward_add_noise_packed(
     """
     bsz, total_tokens = inputs_ids.shape
     device = inputs_ids.device
+    if max_tries < 1:
+        raise ValueError(f"max_tries must be >= 1, got {max_tries}.")
 
     assert len(num_tokens_list) == bsz, (
         f"num_tokens_list length ({len(num_tokens_list)}) must equal bsz ({bsz})."
@@ -503,7 +505,7 @@ class SDARAttention(nn.Module):
         past_key_value: BlockdCache | None = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert position_embeddings is not None
         if past_key_value is None:
             past_key_value = BlockdCache(self.config)

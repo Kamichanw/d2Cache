@@ -559,7 +559,7 @@ def fused_linear_cross_entropy_loss(
     reduction: str = "mean",
     use_l2warp: bool = False,
     l2_penalty_factor: float = 1e-4,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Args:
         x (torch.Tensor): [batch_size * seq_len, hidden_size]
@@ -586,7 +586,8 @@ def fused_linear_cross_entropy_loss(
             'sum': the output will be summed.
             Default: 'mean'.
     Returns:
-        losses: [batch,], float
+        loss: A scalar tensor when reduction is "mean" or "sum"; otherwise an
+            unreduced tensor following the fused loss kernel semantics.
     """
     return FusedLinearCrossEntropyFunction.apply(
         x,

@@ -84,7 +84,7 @@ def generate(
             return int(os.environ[env_name])
         if required:
             raise ValueError(
-                f"{name} must be provided as an argument, environment variable {env_name}, or model config field."
+                f"{name} must be provided as an argument or environment variable {env_name}."
             )
         return None
 

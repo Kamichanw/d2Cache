@@ -13,3 +13,5 @@ python-dotenv
 math_verify
 sympy
 python-Levenshtein
+einops
+triton
