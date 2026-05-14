@@ -1,7 +1,7 @@
 import torch
 from typing import Any
 
-from src.cache import dCache
+from src.cache import BlockdCache, dCache
 from src.frame import Frame, DecodeRecord
 from src.generation.vanilla import (
     generate_step,
@@ -200,12 +200,12 @@ def ar_generate(
 
         start_frame = frame.clone()
         if cache is not None:
-            cache.on_block_start(model, block_mask, frame)
+            cache.on_block_start(block_mask, frame)
 
         block_deltas = []
         while True:
             if cache is not None:
-                cache.on_step_start(model, block_mask, frame)
+                cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
@@ -230,7 +230,7 @@ def ar_generate(
             if delta is None:
                 break
             if cache is not None:
-                cache.on_step_end(model, block_mask, frame, delta)
+                cache.on_step_end(block_mask, frame, delta)
 
             prev_length = frame.generated_tokens.size(-1)
             block_deltas.append(delta.to("cpu"))
@@ -239,12 +239,7 @@ def ar_generate(
                 break
 
         if cache is not None:
-            cache.on_block_end(
-                model,
-                block_mask,
-                start_frame,
-                block_deltas,
-            )
+            cache.on_block_end(block_mask, start_frame, block_deltas)
 
         deltas.extend(block_deltas)
         block_idx += 1

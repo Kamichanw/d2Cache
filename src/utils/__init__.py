@@ -36,7 +36,8 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
     """
     current_version = version("antlr4-python3-runtime")
     logger.info(
-        f"Detected antlr4-python3-runtime version {current_version}. Temporarily switching to {target_version}..."
+        f"Detected antlr4-python3-runtime version {current_version}. Temporarily switching to {target_version}...",
+        rank_zero_only=True,
     )
 
     temp_dir = tempfile.mkdtemp(prefix="isolated_antlr_")
@@ -47,7 +48,8 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
 
     try:
         logger.info(
-            f"Downloading antlr4-python3-runtime=={target_version} to {temp_dir}..."
+            f"Downloading antlr4-python3-runtime=={target_version} to {temp_dir}...",
+            rank_zero_only=True,
         )
         result = subprocess.run(
             [
@@ -73,7 +75,6 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
                 f" (return code: {result.returncode}): {result.stderr}"
             )
 
-        logger.info(f"Unpacking {wheel_files[0].name}...")
         with zipfile.ZipFile(wheel_files[0], "r") as whl:
             whl.extractall(temp_dir_path)
 
@@ -86,7 +87,7 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
         yield
 
     finally:
-        logger.info("Restoring original environment...")
+        logger.info("Restoring original environment...", rank_zero_only=True)
         sys.path[:] = original_sys_path
 
         for k in list(sys.modules.keys()):
@@ -95,7 +96,6 @@ def sympy_antlr_patcher(target_version: str = "4.11.0"):
 
         sys.modules.update(original_modules)
         shutil.rmtree(temp_dir)
-        logger.info("Environment restored.")
 
 
 def get_config_diff(d1: dict, d2: dict) -> dict:

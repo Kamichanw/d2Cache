@@ -1,14 +1,12 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 from contextlib import contextmanager
 from typing import Any
 
+import torch
+import torch.nn.functional as F
 from transformers.cache_utils import DynamicLayer
 
 from src.frame import Frame, FrameDelta
-from src.cache.base import dCache
+from src.cache.base import AttentionContext, CacheState, ModelForwardContext, dCache
 
 
 class BlockDynamicLayer(DynamicLayer):
@@ -16,102 +14,36 @@ class BlockDynamicLayer(DynamicLayer):
     Dynamic cache layer that writes block diffusion KV states by absolute position.
     """
 
-    def lazy_initialization(self, key_states: torch.Tensor):
-        self.dtype, self.device = key_states.dtype, key_states.device
-        batch_size, num_heads, _, head_dim = key_states.shape
-        self.keys = torch.empty(
-            batch_size, num_heads, 0, head_dim, dtype=self.dtype, device=self.device
-        )
-        self.values = torch.empty_like(self.keys)
-        self.filled_mask = torch.zeros(
-            batch_size, 0, dtype=torch.bool, device=self.device
-        )
-        self.is_initialized = True
-
-    def _ensure_length(self, length: int) -> None:
-        assert self.keys is not None and self.values is not None
-        if self.keys.shape[-2] >= length:
-            return
-        pad_length = length - self.keys.shape[-2]
-        key_padding = torch.zeros(
-            self.keys.size(0),
-            self.keys.size(1),
-            pad_length,
-            self.keys.size(-1),
-            dtype=self.keys.dtype,
-            device=self.keys.device,
-        )
-        value_padding = torch.zeros_like(key_padding)
-        self.keys = torch.cat(
-            [self.keys, key_padding],
-            dim=-2,
-        )
-        self.values = torch.cat(
-            [self.values, value_padding],
-            dim=-2,
-        )
-        self.filled_mask = torch.cat(
-            [
-                self.filled_mask,
-                torch.zeros(
-                    self.filled_mask.size(0),
-                    pad_length,
-                    dtype=torch.bool,
-                    device=self.filled_mask.device,
-                ),
-            ],
-            dim=-1,
-        )
-
     def update(
         self,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         cache_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cache_position = (
-            cache_kwargs.get("cache_position") if cache_kwargs is not None else None
-        )
-        active_seq_mask = (
-            cache_kwargs.get("active_seq_mask") if cache_kwargs is not None else None
-        )
-        if cache_position is None:
-            return super().update(key_states, value_states, cache_kwargs)
-
+        # Lazy initialization.
         if not self.is_initialized:
             self.lazy_initialization(key_states)
 
-        assert self.keys is not None and self.values is not None
-        if cache_position.dim() == 1:
-            cache_position = cache_position.unsqueeze(0).expand(key_states.size(0), -1)
-        cache_position = cache_position.to(self.keys.device)
-        self._ensure_length(int(cache_position.max().item()) + 1)
-        cache_rows = torch.arange(key_states.size(0), device=self.keys.device)
-        if active_seq_mask is not None and self.keys.size(0) != key_states.size(0):
-            cache_rows = torch.where(active_seq_mask.to(self.keys.device))[0]
-            if cache_rows.numel() != key_states.size(0):
-                raise ValueError(
-                    "active_seq_mask does not match the cache update batch size."
-                )
-        for src_idx, cache_row in enumerate(cache_rows.tolist()):
-            positions = cache_position[src_idx]
-            self.keys[cache_row, :, positions, :] = key_states[src_idx]
-            self.values[cache_row, :, positions, :] = value_states[src_idx]
-            self.filled_mask[cache_row, positions] = True
-        return self.keys, self.values
+        assert (
+            self.keys is not None
+            and self.values is not None
+            and cache_kwargs is not None
+        )
 
-    def get_seq_length(self) -> int:
-        if not self.is_initialized or self.filled_mask.numel() == 0:
-            return 0
-        filled_positions = self.filled_mask.any(dim=0).nonzero(as_tuple=False)
-        if filled_positions.numel() == 0:
-            return 0
-        return int(filled_positions[-1].item()) + 1
+        cache_position = cache_kwargs["cache_position"]
+        active_rows = cache_kwargs["active_rows"]
 
-    def reset(self) -> None:
-        super().reset()
-        if hasattr(self, "filled_mask"):
-            self.filled_mask.zero_()
+        length = int(cache_position.max().item()) + 1
+        cached_length = self.get_seq_length()
+        if cached_length < length:
+            pad_length = length - cached_length
+            self.keys = F.pad(self.keys, (0, 0, 0, pad_length))
+            self.values = F.pad(self.values, (0, 0, 0, pad_length))
+
+        row_indices = active_rows[:, None]
+        self.keys[row_indices, :, cache_position, :] = key_states.transpose(1, 2)
+        self.values[row_indices, :, cache_position, :] = value_states.transpose(1, 2)
+        return self.keys[active_rows], self.values[active_rows]
 
 
 class BlockdCache(dCache):
@@ -124,187 +56,96 @@ class BlockdCache(dCache):
     """
 
     def __init__(self, model_config):
-        super().__init__(model_config)
-        self._block_length: int | None = None
+        super().__init__(model_config, layer_class_to_replicate=BlockDynamicLayer)
+        self._block_mask: torch.Tensor
+        self._pending_refresh_mask: torch.Tensor | None = None
 
-    def on_block_start(self, model, block_mask: torch.Tensor, frame: Frame):
-        block_width = block_mask.sum(dim=-1)
-        active_width = block_width[block_width > 0]
-        if active_width.numel() > 0:
-            self._block_length = int(active_width.max().item())
-        self.active_q_mask = F.pad(block_mask, (frame.prompts.size(-1), 0), value=False)
+    def on_step_start(self, block_mask: torch.Tensor, frame: Frame):
+        if self._pending_refresh_mask is not None:
+            pending_refresh_mask = F.pad(
+                self._pending_refresh_mask,
+                (0, block_mask.size(-1) - self._pending_refresh_mask.size(-1)),
+                value=False,
+            )
+            self._pending_refresh_mask = None
+            block_mask = block_mask | pending_refresh_mask
+        self._block_mask = block_mask
 
     def on_block_end(
         self,
-        model,
         block_mask: torch.Tensor,
         frame: Frame,
         deltas: list[FrameDelta],
     ):
-        commit_frame = frame
-        for delta in deltas:
-            commit_frame = commit_frame.apply_delta(delta)
-        commit_frame = commit_frame.as_batch().to(
-            device=model.device, dtype=model.dtype
-        )
-        batch_size, prompt_length = commit_frame.prompts.shape
-        x = torch.cat([commit_frame.prompts, commit_frame.generated_tokens], dim=-1)
-        position_ids = (
-            torch.arange(x.size(1), device=x.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        self.active_seq_mask = torch.ones(batch_size, dtype=torch.bool, device=x.device)
-        self.active_q_mask = F.pad(
-            block_mask,
-            (
-                prompt_length,
-                commit_frame.generated_tokens.size(-1) - block_mask.size(-1),
-            ),
-            value=False,
-        )
-        with torch.no_grad():
-            model(
-                x,
-                attention_mask=torch.ones_like(x, dtype=torch.long, device=x.device),
-                position_ids=position_ids,
-                output_hidden_states=False,
-                past_key_values=self,
-                use_cache=True,
-            )
-        self.active_q_mask = None
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        while len(self.layers) <= layer_idx:
-            self.layers.append(BlockDynamicLayer())
-        cache_kwargs = dict(cache_kwargs or {})
-        if self._active_seq_mask is not None:
-            cache_kwargs.setdefault("active_seq_mask", self._active_seq_mask)
-        return super().update(key_states, value_states, layer_idx, cache_kwargs)
+        super().on_block_end(block_mask, frame, deltas)
+        if deltas:
+            # The last step samples after forward; refresh this block in the next forward.
+            self._pending_refresh_mask = block_mask
 
     def reset(self) -> None:
         super().reset()
-        self._block_length = None
-        self.active_q_mask = None
-        self._active_seq_mask = None
+        self._pending_refresh_mask = None
 
     @contextmanager
-    def model_forward(self, x: torch.Tensor):
-        with super().model_forward(x=x) as ctx:
-            batch_size, seq_len, hidden_size = x.shape
-            q_mask = self.active_q_mask
-            if q_mask is not None:
-                if q_mask.size(0) != batch_size:
-                    q_mask = q_mask[self.active_seq_mask]
-                selected = q_mask.sum(dim=-1)
-                if torch.unique(selected).numel() != 1:
-                    raise ValueError(
-                        "Block diffusion cache requires the same number of active query tokens per active sequence."
-                    )
-                ctx.x = x[q_mask].view(batch_size, int(selected[0].item()), hidden_size)
-
-            yield ctx
-
-            if q_mask is not None:
-                assert ctx.logits is not None
-                ctx.logits = torch.zeros(
-                    (batch_size, seq_len, ctx.logits.size(-1)),
-                    dtype=ctx.logits.dtype,
-                    device=ctx.logits.device,
-                ).masked_scatter_(q_mask.unsqueeze(-1), ctx.logits)
-
-    @contextmanager
-    def attention(
+    def model_forward(
         self,
-        layer_idx: int,
         x: torch.Tensor,
-        attn_norm: nn.Module,
-        q_proj: nn.Linear,
-        k_proj: nn.Linear,
-        v_proj: nn.Linear,
-        attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ):
-        with super().attention(
-            layer_idx,
-            x,
-            attn_norm,
-            q_proj,
-            k_proj,
-            v_proj,
-            attention_mask=None,
-            position_ids=position_ids,
-        ) as ctx:
-            if self.active_q_mask is None:
-                if attention_mask is not None and attention_mask.dim() == 2:
-                    q_len = ctx.q.size(-2)
-                    kv_len = ctx.k.size(-2)
-                    if attention_mask.size(-1) < kv_len:
-                        attention_mask = F.pad(
-                            attention_mask,
-                            (0, kv_len - attention_mask.size(-1)),
-                            value=1,
-                        )
-                    ctx.attention_mask = (
-                        attention_mask[:, None, None, :kv_len]
-                        .to(device=x.device, dtype=torch.bool)
-                        .expand(-1, 1, q_len, -1)
-                    )
-                else:
-                    ctx.attention_mask = attention_mask
-                yield ctx
-                return
+        batch_size, seq_len, hidden_size = x.shape
 
-            if position_ids is None:
-                position_ids = (
-                    torch.arange(x.size(1), device=x.device)
-                    .unsqueeze(0)
-                    .expand(x.size(0), -1)
-                )
+        block_mask = self._block_mask
+        prompt_length = seq_len - block_mask.size(-1)
+        self.active_q_mask = F.pad(
+            block_mask, (prompt_length, 0), value=(self.state is CacheState.PREFILL)
+        )
 
-            block_length = self._block_length or x.size(1)
-            q_idx = position_ids.to(x.device)
-            q_len = q_idx.size(1)
-            layer = self.layers[layer_idx] if layer_idx < len(self.layers) else None
-            if layer is not None and layer.is_initialized:
-                assert layer.keys is not None
-                cached_length = layer.keys.size(-2)
-                filled_mask = layer.filled_mask.to(x.device)  # type: ignore
-                if filled_mask.size(0) != x.size(0):
-                    filled_mask = filled_mask[self.active_seq_mask]
-                filled_mask = filled_mask[:, :cached_length]
-            else:
-                cached_length = 0
-                filled_mask = torch.zeros(
-                    x.size(0), 0, dtype=torch.bool, device=x.device
-                )
+        q_mask = self.active_q_mask
+        if q_mask.size(0) != batch_size:
+            q_mask = q_mask[self.active_seq_mask]
 
-            key_value_length = max(
-                cached_length,
-                int(q_idx.max().item()) + 1 if q_idx.numel() > 0 else cached_length,
-            )
-            kv_idx = (
-                torch.arange(key_value_length, device=x.device)
+        q_len = int(q_mask[0].sum().item())
+
+        x = x[q_mask].view(batch_size, q_len, hidden_size)
+
+        if position_ids is None:
+            position_ids = (
+                torch.arange(seq_len, device=x.device)
                 .unsqueeze(0)
-                .expand(x.size(0), -1)
+                .expand(batch_size, -1)
             )
-            valid_kv = torch.zeros(
-                x.size(0), key_value_length, dtype=torch.bool, device=x.device
-            )
-            valid_kv[:, :cached_length] = filled_mask
-            if q_len > 0:
-                valid_kv.scatter_(1, q_idx.clamp_max(key_value_length - 1), True)
-            q_block = q_idx[:, :, None] // block_length
-            kv_block = kv_idx[:, None, :] // block_length
-            ctx.attention_mask = (
-                (kv_block <= q_block) & valid_kv[:, None, :]
-            ).unsqueeze(1)
-            ctx.q_position_ids = q_idx
-            ctx.kv_position_ids = kv_idx
-            yield ctx
+        elif position_ids.size(0) != batch_size:
+            position_ids = position_ids[self.active_seq_mask]
+        position_ids = position_ids[q_mask].view(batch_size, q_len)
+
+        if attention_mask is not None:
+            if attention_mask.size(0) != batch_size:
+                attention_mask = attention_mask[self.active_seq_mask]
+            if attention_mask.dim() == 4 and attention_mask.size(-2) == seq_len:
+                q_idx = torch.nonzero(q_mask, as_tuple=True)[1].view(batch_size, q_len)
+                attention_mask = attention_mask.gather(
+                    2,
+                    q_idx[:, None, :, None].expand(-1, 1, -1, attention_mask.size(-1)),
+                )
+
+        ctx = ModelForwardContext(
+            input_embeds=x,
+            position_ids=position_ids,
+            attention_mask=AttentionContext.convert_attention_mask(
+                attention_mask,
+                dtype=x.dtype,
+                query_length=q_len,
+                key_value_length=max(
+                    self.get_seq_length(), int(position_ids.max().item()) + 1
+                ),
+            ),
+        )
+
+        yield ctx
+
+        assert ctx.logits is not None
+        if q_len != seq_len:
+            left_pad = int(q_mask[0].int().argmax().item())
+            right_pad = seq_len - left_pad - q_len
+            ctx.logits = F.pad(ctx.logits, (0, 0, left_pad, right_pad))

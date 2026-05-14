@@ -2,7 +2,7 @@ import torch
 
 from typing import Any
 
-from src.cache import dCache
+from src.cache import BlockdCache, dCache
 from src.frame import Frame, DecodeRecord
 from src.generation.vanilla import (
     confidence_unmasking,
@@ -91,16 +91,20 @@ def klass_generate(
         active_transfer_mask = transfer_index_mask & block_mask
 
         eps = 1e-12
+        prev_active_probs = prev_probs[active_seq_idx]
+        active_history = kl_history[active_seq_idx]
+
         kl_current_prev = (
             probs
-            * (torch.log(probs + eps) - torch.log(prev_probs[active_seq_idx] + eps))
+            * (torch.log(probs + eps) - torch.log(prev_active_probs + eps))
         ).sum(dim=-1)
 
         # shift kl_history and insert new KL at the end
-        kl_history[active_seq_idx] = kl_history[active_seq_idx].roll(shifts=-1, dims=-1)
-        kl_history[active_seq_idx, ..., -1] = kl_current_prev
+        active_history = active_history.roll(shifts=-1, dims=-1)
+        active_history[..., -1] = kl_current_prev
+        kl_history[active_seq_idx] = active_history
 
-        stable_mask = torch.all(kl_history[active_seq_idx] < kl_threshold, dim=-1)
+        stable_mask = torch.all(active_history < kl_threshold, dim=-1)
         stable_transfer_mask = active_transfer_mask & stable_mask
 
         # case 1: select based on KL stability & confidence
@@ -129,7 +133,10 @@ def klass_generate(
 
         return (
             transfer_index,
-            {"curr_probs": probs, "active_index": active_seq_idx},
+            {
+                "curr_probs": probs,
+                "active_index": active_seq_idx,
+            },
         )
 
     block_idx = 0
@@ -148,11 +155,11 @@ def klass_generate(
 
         start_frame = frame.clone()
         if cache is not None:
-            cache.on_block_start(model, block_mask, frame)
+            cache.on_block_start(block_mask, frame)
         block_deltas = []
         while True:
             if cache is not None:
-                cache.on_step_start(model, block_mask, frame)
+                cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
@@ -178,10 +185,12 @@ def klass_generate(
                 # if no more mask tokens are left, break the loop
                 break
 
-            prev_probs[delta.extra.pop("active_index")] = delta.extra.pop("curr_probs")
+            active_index = delta.extra.pop("active_index")
+            curr_probs = delta.extra.pop("curr_probs")
+            prev_probs[active_index] = curr_probs
             delta = delta.to(dtype=model.dtype)
             if cache is not None:
-                cache.on_step_end(model, block_mask, frame, delta)
+                cache.on_step_end(block_mask, frame, delta)
 
             prev_length = frame.generated_tokens.size(-1)
             block_deltas.append(delta.to("cpu"))
@@ -217,12 +226,7 @@ def klass_generate(
                 break
 
         if cache is not None:
-            cache.on_block_end(
-                model,
-                block_mask,
-                start_frame,
-                block_deltas,
-            )
+            cache.on_block_end(block_mask, start_frame, block_deltas)
 
         deltas.extend(block_deltas)
         block_idx += 1

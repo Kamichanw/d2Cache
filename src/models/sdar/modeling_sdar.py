@@ -15,15 +15,15 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 from einops import rearrange
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import SlidingWindowCache, StaticCache
 from transformers.generation.utils import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub # type: ignore
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+from transformers.integrations import use_kernel_forward_from_hub  # type: ignore
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
@@ -33,7 +33,10 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils.auto_docstring import HARDCODED_CONFIG_FOR_MODELS, auto_docstring
+from transformers.utils.auto_docstring import (
+    HARDCODED_CONFIG_FOR_MODELS,
+    auto_docstring,
+)
 from transformers.utils.generic import can_return_tuple
 from transformers.utils.import_utils import is_torch_flex_attn_available
 from transformers.utils import logging
@@ -51,13 +54,14 @@ except ImportError:
 
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
+
     liger_kernel_is_available = True
 except ImportError:
     liger_kernel_is_available = False
 
 
 if is_torch_flex_attn_available():
-    from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 
 logger = logging.get_logger(__name__)
@@ -76,22 +80,30 @@ def modify_padded_position_ids_2d(position_ids: torch.LongTensor) -> torch.LongT
         The adjusted position ids with shape `(batch_size, sequence_length)`.
     """
     if position_ids.dim() != 2:
-        raise ValueError(f"Input tensor must be 2D, but got {position_ids.dim()} dimensions.")
-        
+        raise ValueError(
+            f"Input tensor must be 2D, but got {position_ids.dim()} dimensions."
+        )
+
     batch_size, seq_len = position_ids.shape
     device = position_ids.device
 
-    col_indices = torch.arange(seq_len, device=device, dtype=position_ids.dtype).expand(batch_size, -1)
-    mask = (position_ids != 0)
+    col_indices = torch.arange(seq_len, device=device, dtype=position_ids.dtype).expand(
+        batch_size, -1
+    )
+    mask = position_ids != 0
 
     masked_indices = col_indices * mask
     last_nonzero_idx = torch.max(masked_indices, dim=1).values
     has_nonzero = torch.any(mask, dim=1)
-    pad_start_idx = torch.where(has_nonzero, last_nonzero_idx + 1, torch.tensor(0, device=device, dtype=position_ids.dtype))
+    pad_start_idx = torch.where(
+        has_nonzero,
+        last_nonzero_idx + 1,
+        torch.tensor(0, device=device, dtype=position_ids.dtype),
+    )
 
     padding_mask = col_indices >= pad_start_idx.unsqueeze(1)
     new_pad_values = col_indices - pad_start_idx.unsqueeze(1)
-    position_ids = torch.where(padding_mask, new_pad_values, position_ids)
+    position_ids = torch.where(padding_mask, new_pad_values, position_ids)  # type: ignore[assignment]
 
     return position_ids
 
@@ -123,10 +135,14 @@ def calculate_token_nums(position_ids: torch.Tensor):
 
         # Add the full row length as a sentinel so the last segment length can
         # be computed with the same adjacent difference operation.
-        split_points = torch.cat([
-            zero_indices,
-            torch.tensor([seq_len], device=pids_row.device, dtype=zero_indices.dtype)
-        ])
+        split_points = torch.cat(
+            [
+                zero_indices,
+                torch.tensor(
+                    [seq_len], device=pids_row.device, dtype=zero_indices.dtype
+                ),
+            ]
+        )
 
         lengths = torch.diff(split_points)
 
@@ -151,31 +167,31 @@ def forward_add_noise_packed(
     while prompt positions are left unchanged.
 
     Args:
-        inputs_ids (torch.Tensor): 
+        inputs_ids (torch.Tensor):
             Token ids with shape `(bsz, total_tokens)`.
-        num_tokens_list (list[torch.Tensor]): 
+        num_tokens_list (list[torch.Tensor]):
             One tensor per batch item. Each tensor stores the lengths of the
             logical samples packed into that row, for example
             `[tensor([len1, len2]), tensor([len3, len4, len5])]`.
-        prompt_mask (torch.Tensor): 
+        prompt_mask (torch.Tensor):
             Boolean tensor with shape `(bsz, total_tokens)`. True positions are
             prompt tokens and must not be noised.
-        mask_id (int): 
+        mask_id (int):
             Token id used to replace noised tokens.
-        eps (float): 
+        eps (float):
             Small floor that prevents the noise rate from becoming exactly zero.
-        max_tries (int): 
+        max_tries (int):
             Maximum retries per batch item to ensure at least one non-prompt
             token is noised.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        - noisy_input_ids (torch.Tensor): 
+        - noisy_input_ids (torch.Tensor):
             Token ids after noising, with shape `(bsz, total_tokens)`.
-        - final_masked_indices (torch.Tensor): 
+        - final_masked_indices (torch.Tensor):
             Boolean mask indicating which positions were noised, with shape
             `(bsz, total_tokens)`.
-        - p_masks (torch.Tensor): 
+        - p_masks (torch.Tensor):
             A 1D tensor containing the noise rate for each noised token.
     """
     bsz, total_tokens = inputs_ids.shape
@@ -183,12 +199,13 @@ def forward_add_noise_packed(
     if max_tries < 1:
         raise ValueError(f"max_tries must be >= 1, got {max_tries}.")
 
-    assert len(num_tokens_list) == bsz, (
-        f"num_tokens_list length ({len(num_tokens_list)}) must equal bsz ({bsz})."
-    )
-    assert prompt_mask.shape == (bsz, total_tokens), (
-        f"prompt_mask shape mismatch, expected {(bsz, total_tokens)}, got {prompt_mask.shape}."
-    )
+    assert (
+        len(num_tokens_list) == bsz
+    ), f"num_tokens_list length ({len(num_tokens_list)}) must equal bsz ({bsz})."
+    assert prompt_mask.shape == (
+        bsz,
+        total_tokens,
+    ), f"prompt_mask shape mismatch, expected {(bsz, total_tokens)}, got {prompt_mask.shape}."
 
     noisy_ids_list = []
     final_masked_indices_list = []
@@ -196,62 +213,71 @@ def forward_add_noise_packed(
 
     # Iterate over batch rows because each row can have a different packed layout.
     for i in range(bsz):
-        current_ids = inputs_ids[i:i+1] # shape: (1, total_tokens)
+        current_ids = inputs_ids[i : i + 1]  # shape: (1, total_tokens)
         current_num_tokens = num_tokens_list[i]
-        current_prompt_mask = prompt_mask[i:i+1] # shape: (1, total_tokens)
-        
+        current_prompt_mask = prompt_mask[i : i + 1]  # shape: (1, total_tokens)
+
         num_samples_in_item = len(current_num_tokens)
-        assert total_tokens == torch.sum(current_num_tokens), \
-            f"Batch item {i} has packed token sum {torch.sum(current_num_tokens)}, expected {total_tokens}."
+        assert total_tokens == torch.sum(
+            current_num_tokens
+        ), f"Batch item {i} has packed token sum {torch.sum(current_num_tokens)}, expected {total_tokens}."
 
         eligible_for_masking = ~current_prompt_mask
 
         if not eligible_for_masking.any():
             noisy_ids_list.append(current_ids)
-            final_masked_indices_list.append(torch.zeros_like(current_prompt_mask, dtype=torch.bool))
-            p_masks_per_token_list.append(torch.full((1, total_tokens), eps, device=device, dtype=torch.float))
+            final_masked_indices_list.append(
+                torch.zeros_like(current_prompt_mask, dtype=torch.bool)
+            )
+            p_masks_per_token_list.append(
+                torch.full((1, total_tokens), eps, device=device, dtype=torch.float)
+            )
             continue
 
-        final_masked_indices_item = torch.zeros_like(current_prompt_mask, dtype=torch.bool)
+        final_masked_indices_item = torch.zeros_like(
+            current_prompt_mask, dtype=torch.bool
+        )
         p_mask_per_token = None
-        
+
         for _ in range(max_tries):
             t = torch.rand(num_samples_in_item, device=device)
             p_mask_per_sample = (1 - eps) * t + eps
 
-            p_mask_per_token_1d = torch.repeat_interleave(p_mask_per_sample, current_num_tokens)
-            p_mask_per_token = p_mask_per_token_1d.unsqueeze(0) # shape: (1, total_tokens)
+            p_mask_per_token_1d = torch.repeat_interleave(
+                p_mask_per_sample, current_num_tokens
+            )
+            p_mask_per_token = p_mask_per_token_1d.unsqueeze(
+                0
+            )  # shape: (1, total_tokens)
 
             masked_indices = torch.rand_like(p_mask_per_token) < p_mask_per_token
             final_masked_indices_item = masked_indices & eligible_for_masking
 
             if final_masked_indices_item.any():
                 break
-        
+
         # Extremely rarely all retries can miss; force one eligible token then.
         if not final_masked_indices_item.any():
-            eligible_indices = torch.nonzero(eligible_for_masking.squeeze(0), as_tuple=True)[0]
+            eligible_indices = torch.nonzero(
+                eligible_for_masking.squeeze(0), as_tuple=True
+            )[0]
             if len(eligible_indices) > 0:
                 random_choice = torch.randint(0, len(eligible_indices), (1,)).item()
-                force_mask_idx = eligible_indices[random_choice]
+                force_mask_idx = eligible_indices[random_choice]  # type: ignore[index]
                 final_masked_indices_item[0, force_mask_idx] = True
 
-        noisy_ids_item = torch.where(
-            final_masked_indices_item,
-            mask_id,
-            current_ids
-        )
-        
+        noisy_ids_item = torch.where(final_masked_indices_item, mask_id, current_ids)
+
         noisy_ids_list.append(noisy_ids_item)
         final_masked_indices_list.append(final_masked_indices_item)
-        p_masks_per_token_list.append(p_mask_per_token)
+        p_masks_per_token_list.append(p_mask_per_token)  # type: ignore[arg-type]
 
     noisy_input_ids = torch.cat(noisy_ids_list, dim=0)
     final_masked_indices = torch.cat(final_masked_indices_list, dim=0)
     p_mask_full = torch.cat(p_masks_per_token_list, dim=0)
-    
+
     p_masks = p_mask_full[final_masked_indices]
-    
+
     return noisy_input_ids, final_masked_indices, p_masks
 
 
@@ -289,8 +315,7 @@ def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
     block_diagonal = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
 
     # **2. Offset Block-Causal Mask (M_OBC) **
-    offset_block_causal = (block_q > block_kv) & (
-        x0_flag_kv == 1) & (x0_flag_q == 0)
+    offset_block_causal = (block_q > block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 0)
 
     # **3. Block-Causal Mask (M_BC) **
     block_causal = (block_q >= block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 1)
@@ -361,27 +386,25 @@ class SDARMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         if liger_kernel_is_available:
-            return self.down_proj(LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
+            return self.down_proj(
+                LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x))
+            )
         else:
-            down_proj = self.down_proj(self.act_fn(
-                self.gate_proj(x)) * self.up_proj(x))
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
             return down_proj
 
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -421,7 +444,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim)
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -443,10 +467,12 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(
-        attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
     attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training)
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -461,8 +487,11 @@ class SDARAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
@@ -472,16 +501,24 @@ class SDARAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
         # unlike olmo, only on the head dim!
         self.q_norm = SDARRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -500,101 +537,56 @@ class SDARAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        attn_norm: nn.Module,
         position_ids: torch.LongTensor | None = None,
-        past_key_value: BlockdCache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        past_key_values: BlockdCache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        assert position_embeddings is not None
-        if past_key_value is None:
-            past_key_value = BlockdCache(self.config)
+        if past_key_values is None:
+            past_key_values = BlockdCache(self.config)
 
-        with past_key_value.attention(
+        with past_key_values.attention(
             self.layer_idx,
             hidden_states,
-            attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
             attention_mask=attention_mask,
-            position_ids=position_ids,
         ) as ctx:
-            attention_mask_for_kernel = ctx.attention_mask
-            current_position_ids = (
-                ctx.q_position_ids if ctx.q_position_ids is not None else position_ids
-            )
+            attention_mask = ctx.attention_mask
 
             query_states = self.q_norm(ctx.q)
             key_states = self.k_norm(ctx.k)
             value_states = ctx.v
 
             cos, sin = position_embeddings
-            if (
-                query_states.shape[-2] != cos.shape[-2]
-                or key_states.shape[-2] != cos.shape[-2]
-            ):
-                raise ValueError(
-                    "SDAR attention requires position embeddings to match the current query/key length."
+            active_q_mask = (
+                past_key_values.active_q_mask if past_key_values is not None else None
+            )
+            if cos.size(-2) != query_states.size(-2):
+                cos = cos[active_q_mask].view(  # type: ignore[index]
+                    query_states.size(0), query_states.size(-2), cos.size(-1)
+                )
+                sin = sin[active_q_mask].view(  # type: ignore[index]
+                    query_states.size(0), query_states.size(-2), sin.size(-1)
                 )
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin
             )
 
-            if past_key_value is not None and kwargs.get("use_cache", False):
-                assert current_position_ids is not None
-                key_states, value_states = past_key_value.update(
+            if past_key_values is not None and kwargs.get("use_cache", False):
+                key_states, value_states = past_key_values.update(
                     key_states,
                     value_states,
                     self.layer_idx,
-                    cache_kwargs={"cache_position": current_position_ids},
+                    cache_kwargs=past_key_values.cache_kwargs,
                 )
-                if (
-                    key_states.size(0) != query_states.size(0)
-                    and past_key_value._active_seq_mask is not None  # type: ignore[attr-defined]
-                ):
-                    key_states = key_states[past_key_value.active_seq_mask]
-                    value_states = value_states[past_key_value.active_seq_mask]
-
-            if (
-                attention_mask_for_kernel is not None
-                and attention_mask is not None
-                and attention_mask_for_kernel.dtype == torch.bool
-                and attention_mask.dim() == 2
-            ):
-                kv_position_ids = ctx.kv_position_ids
-                if kv_position_ids is None:
-                    kv_position_ids = current_position_ids
-                if kv_position_ids is not None:
-                    key_mask = attention_mask.to(
-                        device=attention_mask_for_kernel.device,
-                        dtype=torch.bool,
-                    )
-                    if key_mask.size(0) != attention_mask_for_kernel.size(0):
-                        key_mask = key_mask[past_key_value.active_seq_mask]
-                    if key_mask.size(-1) < kv_position_ids.size(-1):
-                        key_mask = F.pad(
-                            key_mask,
-                            (0, kv_position_ids.size(-1) - key_mask.size(-1)),
-                            value=True,
-                        )
-                    key_mask = torch.gather(
-                        key_mask,
-                        1,
-                        kv_position_ids.to(key_mask.device).clamp_max(
-                            key_mask.size(-1) - 1
-                        ),
-                    )
-                    attention_mask_for_kernel = (
-                        attention_mask_for_kernel & key_mask[:, None, None, :]
-                    )
 
             if self.training:
-                attn_output, attn_weights = fused_flex_attention(
+                attn_output, attn_weights = fused_flex_attention(  # type: ignore
                     query=query_states,
                     key=key_states,
                     value=value_states,
-                    attention_mask=attention_mask_for_kernel,
+                    attention_mask=attention_mask,
                     enable_gqa=True,
                     scale=self.scaling,
                     return_lse=True,
@@ -606,16 +598,14 @@ class SDARAttention(nn.Module):
                 )
                 attn_output = rearrange(attn_output, "b h l d -> b l (h d)")
             else:
-                attention_mask_for_kernel = (
-                    attention_mask_for_kernel.bool()
-                    if attention_mask_for_kernel is not None
-                    else None
-                )
                 attn_weights = None
-                if (
-                    attention_mask_for_kernel is None
-                    or torch.all(attention_mask_for_kernel)
-                ) and flash_attn_func is not None:
+                if attention_mask is None:
+                    can_use_flash = True
+                elif attention_mask.dtype == torch.bool:
+                    can_use_flash = bool(torch.all(attention_mask))
+                else:
+                    can_use_flash = bool(torch.all(attention_mask == 0))
+                if can_use_flash and flash_attn_func is not None:
                     query_states = query_states.transpose(1, 2)
                     key_states = key_states.transpose(1, 2)
                     value_states = value_states.transpose(1, 2)
@@ -632,7 +622,7 @@ class SDARAttention(nn.Module):
                         query=query_states,
                         key=key_states,
                         value=value_states,
-                        attn_mask=attention_mask_for_kernel,
+                        attn_mask=attention_mask,
                         is_causal=False,
                         scale=self.scaling,
                         enable_gqa=True,
@@ -641,7 +631,7 @@ class SDARAttention(nn.Module):
 
             attn_output = self.o_proj(attn_output)
             ctx.o = attn_output
-            ctx.attn_weight = attn_weights
+            ctx.attn_weights = attn_weights
 
         return attn_output, attn_weights
 
@@ -653,13 +643,11 @@ class SDARDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = SDARAttention(config=config, layer_idx=layer_idx)
         self.mlp = SDARMLP(config)
-        self.input_layernorm = SDARRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = SDARRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = SDARRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps)
-        if (
-            config.sliding_window and config._attn_implementation != "flash_attention_2"
-        ):
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        if config.sliding_window and config._attn_implementation != "flash_attention_2":
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
@@ -670,46 +658,43 @@ class SDARDecoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_value: BlockdCache | None = None,
+        past_key_values: BlockdCache | None = None,
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
         # necessary, but kept here for BC
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         # Self Attention
         residual = hidden_states
-        if past_key_value is None:
-            past_key_value = BlockdCache(self.self_attn.config)
+        if past_key_values is None:
+            past_key_values = BlockdCache(self.self_attn.config)
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            attn_norm=self.input_layernorm,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
+            position_embeddings=position_embeddings,  # type: ignore[arg-type]
             **kwargs,
         )
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        with past_key_value.ffn(self.layer_idx, hidden_states) as ctx:
-            hidden_states = self.post_attention_layernorm(ctx.x)
+        with past_key_values.ffn(self.layer_idx, hidden_states) as ctx:
+            hidden_states = self.post_attention_layernorm(ctx.hidden_states)
             hidden_states = self.mlp(hidden_states)
             ctx.ffn_out = hidden_states
 
-        hidden_states = ctx.residual + ctx.ffn_out
+        hidden_states = residual + ctx.ffn_out  # type: ignore[operator]
 
         outputs = (hidden_states,)
         if output_attentions:
-            outputs += (self_attn_weights,)
+            outputs += (self_attn_weights,)  # type: ignore[assignment]
 
-        return outputs
+        return outputs  # type: ignore[return-value]
 
 
 @auto_docstring
@@ -747,7 +732,8 @@ class SDARRotaryEmbedding(nn.Module):
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
             self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type"))
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -756,8 +742,7 @@ class SDARRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(
-            self.config, device)
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -765,15 +750,23 @@ class SDARRotaryEmbedding(nn.Module):
     # power user: used with advanced RoPE types (e.g. dynamic rope)
     @dynamic_rope_update
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(
-            position_ids.shape[0], -1, 1).to(x.device)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = x.device.type if isinstance(
-            x.device.type, str) and x.device.type != "mps" else "cpu"
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @
-                     position_ids_expanded.float()).transpose(1, 2)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -789,10 +782,13 @@ class SDARModel(SDARPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx)
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
         self.layers = nn.ModuleList(
-            [SDARDecoderLayer(config, layer_idx)
-             for layer_idx in range(config.num_hidden_layers)]
+            [
+                SDARDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = SDARRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = SDARRotaryEmbedding(config=config)
@@ -819,18 +815,24 @@ class SDARModel(SDARPreTrainedModel):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds")
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once(
@@ -839,8 +841,7 @@ class SDARModel(SDARPreTrainedModel):
             use_cache = False
 
         if not isinstance(past_key_values, (type(None), BlockdCache)):
-            raise ValueError(
-                "SDAR only supports BlockdCache as `past_key_values`.")
+            raise ValueError("SDAR only supports BlockdCache as `past_key_values`.")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -848,37 +849,31 @@ class SDARModel(SDARPreTrainedModel):
         if past_key_values is None:
             past_key_values = BlockdCache(self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length()
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        # causal_mask = self._update_causal_mask(
-        #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        # )
+            position_ids = (
+                torch.arange(  # type: ignore[assignment]
+                    inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+                .unsqueeze(0)
+                .expand(inputs_embeds.shape[0], -1)
+            )  # type: ignore[assignment]
 
         cm = ctx = None
         if use_cache:
-            cm = past_key_values.model_forward(inputs_embeds)
-            ctx = cm.__enter__()
-            hidden_states = ctx.x
-            q_mask = past_key_values.active_q_mask
-            if q_mask is not None:
-                if q_mask.size(0) != inputs_embeds.size(0):
-                    q_mask = q_mask[past_key_values.active_seq_mask]
-                if position_ids.size(0) == 1 and q_mask.size(0) > 1:
-                    position_ids = position_ids.expand(q_mask.size(0), -1)
-                if position_ids.shape[-1] != hidden_states.shape[1]:
-                    position_ids = position_ids[q_mask].view(hidden_states.size(0), -1)
+            cm = past_key_values.model_forward(
+                inputs_embeds,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+            )
+            ctx = cm.__enter__()  # type: ignore[union-attr]
+            hidden_states = ctx.input_embeds  # type: ignore[union-attr]
+            position_ids = ctx.position_ids  # type: ignore[union-attr]
+            attention_mask = ctx.attention_mask  # type: ignore[union-attr]
         else:
             hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)  # type: ignore[arg-type]
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -886,16 +881,15 @@ class SDARModel(SDARPreTrainedModel):
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states += (hidden_states,)  # type: ignore[operator]
 
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **flash_attn_kwargs,
             )
@@ -903,13 +897,13 @@ class SDARModel(SDARPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[1],)  # type: ignore[operator]
 
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states += (hidden_states,)  # type: ignore[operator]
 
         output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -922,175 +916,6 @@ class SDARModel(SDARPreTrainedModel):
             output.ctx = ctx  # type: ignore[attr-defined]
         return output
 
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor | "BlockMask",
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: BlockdCache | None,
-        output_attentions: bool = False,
-    ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and past_key_values is not None:
-                is_padding_right = attention_mask[:, -
-                                                  1].sum().item() != input_tensor.size()[0]
-                if is_padding_right:
-                    raise ValueError(
-                        "You are attempting to perform batched generation with padding_side='right'"
-                        " this may lead to unexpected behavior for SDAR Flash Attention. Make sure to "
-                        " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
-                    )
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-        if self.config._attn_implementation == "flex_attention":
-            if isinstance(attention_mask, torch.Tensor):
-                seq_len_q, seq_len_kv = attention_mask.shape
-                assert seq_len_q == seq_len_kv, f"got {attention_mask.shape=}"
-                attention_mask = create_block_mask(
-                    # 2d bool tensor, shape: [2*seqlen, 2*seqlen]
-                    lambda b, h, q_idx, kv_idx: attention_mask[q_idx, kv_idx],
-                    B=None, H=None, Q_LEN=seq_len_q, KV_LEN=seq_len_kv,
-                )
-            else:
-                # Here we pass in flex mask computed externally
-                assert isinstance(attention_mask, BlockMask)
-            return attention_mask
-
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length(
-        ) if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
-        using_sliding_window_cache = isinstance(
-            past_key_values, SlidingWindowCache)
-
-        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if (
-            self.config._attn_implementation == "sdpa"
-            and not (using_static_cache or using_sliding_window_cache)
-            and not output_attentions
-        ):
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                sliding_window=self.config.sliding_window,
-                is_training=self.training,
-            ):
-                return None
-
-        dtype = input_tensor.dtype
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-        # SlidingWindowCache or StaticCache
-        if using_sliding_window_cache or using_static_cache:
-            target_length = past_key_values.get_max_cache_shape()
-        # Dynamic cache or no cache
-        else:
-            target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
-            )
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-            config=self.config,
-            past_key_values=past_key_values,
-        )
-
-        if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type in ["cuda", "xpu", "npu"]
-            and not output_attentions
-        ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(
-                causal_mask, min_dtype)
-
-        return causal_mask
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        config: SDARConfig,
-        past_key_values: BlockdCache | None,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-            config (`SDARConfig`):
-                The model's configuration class
-            past_key_values (`BlockdCache`, optional):
-                The cache class that is being used currently to generate.
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
-            )
-            diagonal_attend_mask = torch.arange(target_length, device=cache_position.device) > cache_position.reshape(
-                -1, 1
-            )
-            text_config = config.get_text_config()
-            if getattr(text_config, "use_sliding_window", True) and text_config.sliding_window is not None:
-                # if we have sliding window, we should not attend to tokens beyond sliding window length, so we mask them out also
-                # the check is needed to verify is current checkpoint was trained with sliding window or not
-                if not isinstance(past_key_values, SlidingWindowCache) or sequence_length > target_length:
-                    sliding_attend_mask = torch.arange(target_length, device=cache_position.device) <= (
-                        cache_position.reshape(-1, 1) -
-                        text_config.sliding_window
-                    )
-                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
-            causal_mask *= diagonal_attend_mask
-            causal_mask = causal_mask[None, None,
-                                      :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                if attention_mask.shape[-1] > target_length:
-                    attention_mask = attention_mask[:, :target_length]
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-        return causal_mask
 
 @auto_docstring
 class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
@@ -1102,8 +927,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = SDARModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1126,19 +950,25 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    def prepare_for_bd_training(self, inputs_ids, position_ids, prompt_mask):
+    def prepare_for_bd_training(
+        self, inputs_ids, position_ids, prompt_mask, mask_token_id: int
+    ):
         bsz, seq_len = inputs_ids.shape
-        num_tokens = calculate_token_nums(position_ids) # list[torch.Tensor]
+        num_tokens = calculate_token_nums(position_ids)  # list[torch.Tensor]
         noisy_inputs_ids, logits_to_keep_half, p_mask = forward_add_noise_packed(
             inputs_ids=inputs_ids,
             num_tokens_list=num_tokens,
             prompt_mask=prompt_mask,
-            mask_id=self.config.mask_token_id,
+            mask_id=mask_token_id,
         )
         router_noisy_part_list = []
         for i in range(bsz):
-            cur_router_noisy_part = (torch.arange(num_tokens[i].shape[0] *2) % 2 == 0).to(inputs_ids.device)
-            cur_router_noisy_part = cur_router_noisy_part.repeat_interleave(num_tokens[i].repeat_interleave(2))
+            cur_router_noisy_part = (
+                torch.arange(num_tokens[i].shape[0] * 2) % 2 == 0
+            ).to(inputs_ids.device)
+            cur_router_noisy_part = cur_router_noisy_part.repeat_interleave(
+                num_tokens[i].repeat_interleave(2)
+            )
             router_noisy_part_list.append(cur_router_noisy_part)
         router_noisy_part = torch.stack(router_noisy_part_list, dim=0)
 
@@ -1146,10 +976,12 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         concat_inputs_ids = inputs_ids.repeat(1, 2)
         # concated logits_to_keep: (bsz, seq_len x 2)
         logits_to_keep = torch.zeros(
-                    bsz, 2 * seq_len, dtype=torch.bool, device=inputs_ids.device)
+            bsz, 2 * seq_len, dtype=torch.bool, device=inputs_ids.device
+        )
         # concated position_ids: (bsz, seq_len x 2)
         concat_position_ids = torch.zeros(
-                    bsz, 2 * seq_len, dtype=position_ids.dtype, device=position_ids.device)
+            bsz, 2 * seq_len, dtype=position_ids.dtype, device=position_ids.device
+        )
         for i in range(bsz):
             concat_inputs_ids[i][router_noisy_part[i]] = noisy_inputs_ids[i]
             concat_inputs_ids[i][~router_noisy_part[i]] = inputs_ids[i]
@@ -1160,14 +992,25 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             concat_position_ids[i][~router_noisy_part[i]] = position_ids[i]
 
         # create flex_attention mask
-        attention_mask = block_attn_mask(num_tokens, self.config.block_size, inputs_ids.device)
+        attention_mask = block_attn_mask(
+            num_tokens, self.config.block_size, inputs_ids.device
+        )
         flex_attention_mask_3d = create_block_mask(
-                            lambda b, h, q_idx, kv_idx: attention_mask[b, q_idx, kv_idx],
-                            B=attention_mask.size(0), H=None,
-                            Q_LEN=attention_mask.size(1), KV_LEN=attention_mask.size(2),
+            lambda b, h, q_idx, kv_idx: attention_mask[b, q_idx, kv_idx],
+            B=attention_mask.size(0),
+            H=None,
+            Q_LEN=attention_mask.size(1),
+            KV_LEN=attention_mask.size(2),
         )
 
-        return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask
+        return (
+            concat_inputs_ids,
+            concat_position_ids,
+            flex_attention_mask_3d,
+            logits_to_keep_half,
+            logits_to_keep,
+            p_mask,
+        )
 
     @can_return_tuple
     @auto_docstring
@@ -1182,7 +1025,6 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> CausalLMOutputWithPast:
@@ -1208,22 +1050,40 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         if not isinstance(past_key_values, (type(None), BlockdCache)):
-            raise ValueError(
-                "SDAR only supports BlockdCache as `past_key_values`."
-            )
+            raise ValueError("SDAR only supports BlockdCache as `past_key_values`.")
         if self.training:
             assert inputs_embeds is None, "only support input_ids during training"
             assert labels is not None, "Labels must be provided for training."
-            assert position_ids is not None, "position_ids must be provided for training."
+            assert (
+                position_ids is not None
+            ), "position_ids must be provided for training."
+            mask_token_id = kwargs.pop("mask_token_id", None)
+            if mask_token_id is None:
+                mask_token_id = int(os.environ["MASK_TOKEN_ID"])
             prompt_mask = labels == -100
             position_ids = modify_padded_position_ids_2d(position_ids)
-            concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask = self.prepare_for_bd_training(input_ids, position_ids, prompt_mask)
+            (
+                concat_inputs_ids,
+                concat_position_ids,
+                flex_attention_mask_3d,
+                logits_to_keep_half,
+                logits_to_keep,
+                p_mask,
+            ) = self.prepare_for_bd_training(
+                input_ids, position_ids, prompt_mask, mask_token_id
+            )
             outputs = self.model(
                 input_ids=concat_inputs_ids,
                 attention_mask=flex_attention_mask_3d,
@@ -1232,26 +1092,25 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=True,
-                cache_position=cache_position,
                 **kwargs,
             )
             hidden_states = outputs.last_hidden_state
             hidden_states = hidden_states[logits_to_keep].contiguous()
             answer_len = (labels != -100).sum()
-            loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
+            loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction="sum")
             loss = loss_fct(  # it will return (sum_loss, unreduced_loss)
-                    # conduct `view(-1, V)` inside the function
-                    x=hidden_states,
-                    target=labels[logits_to_keep_half].contiguous(),
-                    weight=self.lm_head.weight,
-                    bias=self.lm_head.bias,
-                    p_mask=p_mask,
-                )
+                # conduct `view(-1, V)` inside the function
+                x=hidden_states,
+                target=labels[logits_to_keep_half].contiguous(),
+                weight=self.lm_head.weight,
+                bias=self.lm_head.bias,
+                p_mask=p_mask,
+            )
             loss = loss / answer_len
             logits = None
         else:
             # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-            outputs: BaseModelOutputWithPast = self.model(
+            outputs: BaseModelOutputWithPast = self.model(  # type: ignore[no-redef]
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1260,16 +1119,20 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                cache_position=cache_position,
                 **kwargs,
             )
 
             hidden_states = outputs.last_hidden_state
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            slice_indices = slice(-logits_to_keep,
-                                None) if isinstance(logits_to_keep, int) else logits_to_keep
+            slice_indices = (
+                slice(-logits_to_keep, None)
+                if isinstance(logits_to_keep, int)
+                else logits_to_keep
+            )
             hidden_states = hidden_states[:, slice_indices, :].contiguous()
-            fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
+            fuse_linear_and_cross_entropy = (
+                self.config.fuse_cross_entropy and self.training
+            )
             if fuse_linear_and_cross_entropy:
                 # When using fused_linear_ce_loss, we do not compute the whole logits on HBM
                 logits = None
@@ -1284,9 +1147,10 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             if labels is not None:
                 # FusedLinearCrossEntropyLoss will be implemented by monkey patch when training
                 # We don't use it when inferencing
-                loss_fct = nn.CrossEntropyLoss()  # nn.CE
+                loss_fct = nn.CrossEntropyLoss()  # type: ignore[assignment]  # nn.CE
                 loss = loss_fct(
-                    logits.view(-1, self.config.vocab_size), labels.view(-1))
+                    logits.view(-1, self.config.vocab_size), labels.view(-1)  # type: ignore[union-attr]
+                )
 
         return CausalLMOutputWithPast(
             loss=loss,

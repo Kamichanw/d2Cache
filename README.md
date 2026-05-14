@@ -59,7 +59,7 @@ The corresponding usages can be found [here](./docs/kv_caching.md).
 | Method | Paper | Original Code Repo |
 |:---|:---:|:---:|
 | PrefixCache / DualCache | <a href="https://arxiv.org/abs/2505.22618 "> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2505.22618-58C9ED"> </a> | <a href="https://github.com/NVLabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
-| dLLM Cache | <a href="https://arxiv.org/abs/2506.06295"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2506.06295-red"></a> | <a href="https://github.com/maomaocun/dLLM-Cache"><img alt="Static Badge" src="https://img.shields.io/github/stars/maomaocun/dLLM-Cache?style=social&label=Stars"></a> |
+| dLLM Cache | <a href="https://arxiv.org/abs/2506.06295"> <img alt="Static Badge" src="https://img.shields.io/badge/ICML-2506.06295-green"></a> | <a href="https://github.com/maomaocun/dLLM-Cache"><img alt="Static Badge" src="https://img.shields.io/github/stars/maomaocun/dLLM-Cache?style=social&label=Stars"></a> |
 | d2Cache | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2509.23094-58C9ED"> </a> | This Repo |
 | BlockDiffusion Cache | <a href="https://arxiv.org/abs/2510.06303"> <img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2510.06303-red"></a> | <a href="https://github.com/JetAstra/SDAR"><img alt="Static Badge" src="https://img.shields.io/github/stars/JetAstra/SDAR?style=social&label=Stars"></a> |
 
@@ -71,7 +71,7 @@ The corresponding usages can be found [here](./docs/decoding_strategies.md).
 | Auto-regressive | - | - |
 | Vanilla / Semi-AR | <a href="https://arxiv.org/abs/2502.09992"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Oral-2502.09992-purple"></a> | <a href="https://github.com/ML-GSAI/LLaDA"><img alt="Static Badge" src="https://img.shields.io/github/stars/ML-GSAI/LLaDA?style=social&label=Stars"></a> |
 | Parallel | <a href="https://arxiv.org/abs/2505.22618"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2505.22618-58C9ED"> </a> | <a href="https://github.com/NVlabs/Fast-dLLM"><img alt="Static Badge" src="https://img.shields.io/github/stars/NVLabs/Fast-dLLM?style=social&label=Stars"></a> |
-| PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/arXiv-2508.13021-red"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/github/stars/NEUIR/PC-Sampler?style=social&label=Stars"></a> |
+| PC-Sampler | <a href="https://arxiv.org/abs/2508.13021"><img alt="Static Badge" src="https://img.shields.io/badge/ACL-2508.13021-E92529"></a> | <a href="https://github.com/NEUIR/PC-Sampler"><img alt="Static Badge" src="https://img.shields.io/github/stars/NEUIR/PC-Sampler?style=social&label=Stars"></a> |
 | Certainty Prior Decoding | <a href="https://arxiv.org/abs/2509.23094"> <img alt="Static Badge" src="https://img.shields.io/badge/ICLR-2509.23094-58C9ED"> </a> | This Repo|
 | KLASS | <a href="https://arxiv.org/abs/2511.05664"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS Spotlight-2511.05664-purple"></a> | <a href="https://github.com/shkim0116/KLASS"><img alt="Static Badge" src="https://img.shields.io/github/stars/shkim0116/KLASS?style=social&label=Stars"></a> |
 | EB-Sampler | <a href="https://arxiv.org/abs/2505.24857"><img alt="Static Badge" src="https://img.shields.io/badge/NIPS-2511.05664-purple"></a> | Not release |

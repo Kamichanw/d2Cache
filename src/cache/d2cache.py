@@ -1,21 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from contextlib import contextmanager
-from transformers.cache_utils import StaticLayer
 
 from src.frame import Frame, FrameDelta
 from src.utils import (
     certainty_density,
     nucleus_select,
     top_up_mask_,
-    is_adapted_from_ar,
 )
-from src.cache.base import dCache, AttentionContext
+from src.cache.base import AttentionContext, CacheState, StaticdCacheLayer, dCache
 
 
 class d2Cache(dCache):
-
     def __init__(
         self,
         model_config,
@@ -24,7 +22,7 @@ class d2Cache(dCache):
         sigma: float = 10.0,
         inflate_w: int = 4,
     ):
-        super().__init__(model_config)
+        super().__init__(model_config, layer_class_to_replicate=StaticdCacheLayer)
         self._conf_cache: torch.Tensor | None = None  # shape (B, G)
         self._full_q_mask: torch.Tensor | None = None  # shape (B, T)
         self._density_score: torch.Tensor  # shape (B, G)
@@ -35,17 +33,36 @@ class d2Cache(dCache):
         self.inflate_w = inflate_w
 
     @contextmanager
-    def model_forward(self, x: torch.Tensor):
-        with super().model_forward(x=x) as ctx:
+    def model_forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        with super().model_forward(
+            x=x,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        ) as ctx:
             B, T, C = x.shape
-            if self._full_q_mask is not None:
+            if self.state is CacheState.DECODE:
+                assert self._full_q_mask is not None
                 self.active_q_mask = self.top_up_mask(
                     self._full_q_mask[self.active_seq_mask]
                 )
-                ctx.x = x[self.active_q_mask].view(B, -1, C)
+                ctx.input_embeds = x[self.active_q_mask].view(B, -1, C)
+                if position_ids is not None:
+                    ctx.position_ids = position_ids[self.active_q_mask].view(B, -1)
+            ctx.attention_mask = AttentionContext.convert_attention_mask(
+                attention_mask,
+                dtype=x.dtype,
+                query_length=ctx.input_embeds.size(1),
+                key_value_length=T,
+            )
+
             yield ctx
 
-            if self._full_q_mask is not None:
+            if self.state is CacheState.DECODE:
                 assert ctx.logits is not None and self.active_q_mask is not None
                 ctx.logits = torch.zeros(
                     (B, T, ctx.logits.size(-1)),
@@ -58,80 +75,25 @@ class d2Cache(dCache):
         self,
         layer_idx: int,
         x: torch.Tensor,
-        attn_norm: nn.Module,
         q_proj: nn.Linear,
         k_proj: nn.Linear,
         v_proj: nn.Linear,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
     ):
         with super().attention(
-            layer_idx,
-            x,
-            attn_norm,
-            q_proj,
-            k_proj,
-            v_proj,
-            attention_mask,
-            position_ids,
+            layer_idx, x, q_proj, k_proj, v_proj, attention_mask
         ) as ctx:
-            if (
-                layer_idx >= len(self.layers)
-                or not self.layers[layer_idx].is_initialized
-            ):
-                # the first forward pass, store states as cache
-                while len(self.layers) <= layer_idx:
-                    self.layers.append(StaticLayer(x.shape[1]))
-                self.update(ctx.k, ctx.v, layer_idx)
-                layer = self.layers[layer_idx]
-                assert layer.keys is not None and layer.values is not None
-            else:
-                assert self.active_q_mask is not None
-                layer = self.layers[layer_idx]
-                assert layer.keys is not None and layer.values is not None
-                if layer_idx == 0:
-                    active_seq_idx = torch.where(self.active_seq_mask)[0]
-                    m_nonzero = self.active_q_mask.nonzero(as_tuple=False)
-                    self._active_q_indices = (
-                        active_seq_idx[m_nonzero[:, 0]],
-                        m_nonzero[:, 1],
-                    )
-
-                rows, cols = self._active_q_indices
-                layer.keys[rows, :, cols, :] = ctx.k.transpose(1, 2).flatten(0, 1)
-                layer.values[rows, :, cols, :] = ctx.v.transpose(1, 2).flatten(0, 1)
-                ctx.k = layer.keys[self.active_seq_mask]
-                ctx.v = layer.values[self.active_seq_mask]
-
-            if layer_idx == 0:
-                # cache common variables sharing among layers
-                self._q_position_ids, self._kv_position_ids = (
-                    AttentionContext.select_position_ids(
-                        position_ids, self.active_q_mask
-                    )
-                )
-                self._attention_mask = AttentionContext.convert_attention_mask(
-                    attention_mask,
-                    dtype=ctx.k.dtype,
-                    query_length=ctx.q.shape[-2],
-                    key_value_length=layer.values.shape[-2],
-                )
-
-            ctx.q_position_ids = self._q_position_ids
-            ctx.kv_position_ids = self._kv_position_ids
-            ctx.attention_mask = self._attention_mask
             yield ctx
 
             assert (
-                ctx.attn_weight is not None
+                ctx.attn_weights is not None
             ), 'The attention weights must be outputed, make sure you\'ve set attn_implementation="eager"'
 
             if layer_idx == 0:
-                # shape: (B, pooled_size, pooled_size)
                 self._attn_rollout = torch.eye(
-                    layer.keys.size(-2), device=x.device, dtype=x.dtype
+                    ctx.attn_weights.size(-1), device=x.device, dtype=x.dtype
                 ).expand(x.size(0), -1, -1)
-            self.accumulate_attn_rollout(ctx.attn_weight)
+            self.accumulate_attn_rollout(ctx.attn_weights)
 
     def top_up_mask(self, q_mask: torch.Tensor):
         q_mask = q_mask.clone()
@@ -163,9 +125,10 @@ class d2Cache(dCache):
         device, dtype = attn_scores.device, attn_scores.dtype
 
         # inject the rectangular attention map into the rows
-        if self.active_q_mask is None:
+        if self.state is CacheState.PREFILL:
             effective_attn = attn_scores.mean(dim=1)
         else:
+            assert self.active_q_mask is not None
             effective_attn = torch.eye(seq_len, device=device, dtype=dtype).repeat(
                 B, 1, 1
             )
@@ -179,9 +142,8 @@ class d2Cache(dCache):
 
         self._attn_rollout = residual_attn @ self._attn_rollout
 
-    def on_step_end(
-        self, model, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta
-    ):
+    def on_step_end(self, block_mask: torch.Tensor, frame: Frame, delta: FrameDelta):
+        super().on_step_end(block_mask, frame, delta)
         confidence = delta.confidence
         assert confidence is not None
         B, P = frame.prompts.shape
@@ -200,9 +162,8 @@ class d2Cache(dCache):
         remaining_mask = (
             new_frame.generated_tokens[self.active_seq_mask] == self.mask_token_id
         )
-        if self.active_q_mask is not None:
-            # only position where are selected at previous step and are still masked
-            # can produce valid confidence scores
+        if self.state is CacheState.DECODE:
+            assert self.active_q_mask is not None
             valid_mask = (
                 self.active_q_mask[:, P:] & frame.generated_tokens[self.active_seq_mask]
                 == self.mask_token_id
@@ -241,7 +202,7 @@ class d2Cache(dCache):
             & remaining_mask
         )
         # if model is dream, we need to retain the token before masked tokens
-        if is_adapted_from_ar(self.model_config):
+        if self.model_config.model_type.lower() == "dream":
             response_mask = F.pad(selected_mask[:, 1:], (0, 1), value=False)
         else:
             response_mask = selected_mask
@@ -266,7 +227,7 @@ class d2Cache(dCache):
         global_importance = self._attn_rollout.sum(dim=1)
         q_mask |= nucleus_select(global_importance, self.rollout_p, mask=~q_mask)
 
-        if is_adapted_from_ar(self.model_config):
+        if self.model_config.model_type.lower() == "dream":
             # if the first mask token is selected, we need to select the token before it
             # i.e., the last prompt token
             q_mask[:, P - 1] = selected_mask[:, 0]  # type: ignore
@@ -304,3 +265,8 @@ class d2Cache(dCache):
             self._full_q_mask[self.active_seq_mask] = q_mask
             self._global_importance[self.active_seq_mask] = global_importance
             self._density_score[self.active_seq_mask] = scores
+
+    def reset(self) -> None:
+        super().reset()
+        self._conf_cache = None
+        self._full_q_mask = None

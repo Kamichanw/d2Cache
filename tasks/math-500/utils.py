@@ -10,6 +10,72 @@ import datasets
 eval_logger = logging.getLogger(__name__)
 
 
+_BOX_RE = re.compile(r"\\(?:boxed|box)\s*\{")
+
+
+def _find_boxed_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+
+    for match in _BOX_RE.finditer(text):
+        start = match.start()
+        idx = match.end()
+        depth = 1
+
+        while idx < len(text) and depth > 0:
+            if text[idx] == "{":
+                depth += 1
+            elif text[idx] == "}":
+                depth -= 1
+            idx += 1
+
+        if depth == 0:
+            spans.append((start, idx, text[match.end() : idx - 1]))
+
+    return spans
+
+
+def _extract_last_boxed_content(text: str) -> Optional[str]:
+    spans = _find_boxed_spans(text)
+    if not spans:
+        return None
+    return spans[-1][2].strip()
+
+
+def _safe_parse(text: str):
+    try:
+        return parse(text)
+    except Exception:
+        return None
+
+
+def _extract_gold_final_answer(gold_solution: str) -> str:
+    boxed_content = _extract_last_boxed_content(gold_solution)
+    if boxed_content is not None:
+        return normalize_final_answer(boxed_content)
+    return normalize_final_answer(get_unnormalized_answer(gold_solution))
+
+
+def _answers_match(pred_answer: str, gold_answer: str) -> bool:
+    if not pred_answer or pred_answer == "[invalidanswer]":
+        return False
+
+    parsed_pred = _safe_parse(pred_answer)
+    parsed_gold = _safe_parse(gold_answer)
+
+    try:
+        if (
+            isinstance(parsed_pred, list)
+            and len(parsed_pred) > 0
+            and isinstance(parsed_gold, list)
+            and len(parsed_gold) > 0
+        ):
+            return bool(verify(parsed_pred, parsed_gold))
+    except Exception:
+        pass
+
+    return pred_answer == gold_answer
+
+
 try:
     import antlr4
     import sympy
@@ -29,15 +95,16 @@ except (ModuleNotFoundError, AssertionError) as e:
 def doc_to_text(doc: dict) -> str:
     return "Problem:" + "\n" + doc["problem"] + "\n\n" + "Solution:"
 
+def doc_to_text_instruct(doc: dict) -> str:
+    return doc["problem"] + "\n" + "Please reason step by step and put the final answer within \\\boxed{}."
+
 
 def process_docs(dataset: datasets.Dataset) -> datasets.Dataset:
     def _process_doc(doc: dict) -> dict:
         out_doc = {
             "problem": doc["problem"],
             "solution": doc["solution"],
-            "answer": normalize_final_answer(
-                remove_boxed(last_boxed_only_string(doc["solution"]))
-            ),
+            "answer": _extract_gold_final_answer(doc["solution"]),
         }
         if getattr(doc, "few_shot", None) is not None:
             out_doc["few_shot"] = True
@@ -72,28 +139,27 @@ def list_fewshot_samples() -> list[dict]:
 
 
 def process_results(doc: dict, results: list[str]) -> dict[str, int]:
-    candidates = results[0]
+    candidate = results[0]
 
-    unnormalized_answer = get_unnormalized_answer(candidates)
-    answer = normalize_final_answer(unnormalized_answer)
+    pred_answer = normalize_final_answer(get_unnormalized_answer(candidate))
+    gold_answer = doc["answer"]
 
-    if is_equiv(answer, doc["answer"]):
-        retval = 1
-    else:
-        retval = 0
+    correct = 1 if _answers_match(pred_answer, gold_answer) else 0
 
-    # math_verify
-    _mvres = verify(
-        gold=parse(doc["solution"]),
-        target=parse(candidates),
-    )
-    mathval = 1 if _mvres else 0
+    try:
+        math_verify_ok = bool(
+            verify(
+                gold=parse(doc["solution"]),
+                target=parse(candidate),
+            )
+        )
+    except Exception:
+        math_verify_ok = False
 
-    res = {
-        "exact_match": retval,
-        "math_verify": mathval,
+    return {
+        "exact_match": correct,
+        "math_verify": 1 if math_verify_ok else 0,
     }
-    return res
 
 
 def last_boxed_only_string(string: str) -> Optional[str]:
@@ -201,16 +267,28 @@ def is_equiv(x1: str, x2: str) -> bool:
 
 def get_unnormalized_answer(text: str) -> str:
     INVALID_ANSWER = "[invalidanswer]"
-    end_seq = "I hope it is correct."
-    text += end_seq
-    match = re.search(
-        r"Final Answer: The final answer is(.*?). I hope it is correct.",
-        text,
-    )
-    if match:
-        return match.group(1).strip()
-    else:
-        return INVALID_ANSWER
+
+    boxed_content = _extract_last_boxed_content(text)
+    if boxed_content:
+        return boxed_content
+
+    final_patterns = [
+        r"Final Answer:\s*The final answer is\s*(.*?)(?:\.\s*I hope it is correct\.?\s*$|$)",
+        r"Final Answer:\s*(.*?)(?:$|\n)",
+        r"final answer is\s*(.*?)(?:$|\n)",
+    ]
+    for pattern in final_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate:
+                return candidate
+
+    extracted_candidates = _safe_parse(text)
+    if isinstance(extracted_candidates, list) and len(extracted_candidates) > 0:
+        return str(extracted_candidates[-1]).strip()
+
+    return INVALID_ANSWER
 
 
 SUBSTITUTIONS = [
@@ -274,35 +352,26 @@ REMOVED_EXPRESSIONS = [
 def normalize_final_answer(final_answer: str) -> str:
     """
     Normalize a final answer to a quantitative reasoning question.
-
-    Copied character for character from appendix D of Lewkowycz et al. (2022)
+    Aligned with the training reward normalizer.
     """
-    final_answer = final_answer.split("=")[-1]
+    final_answer = final_answer.strip()
 
     for before, after in SUBSTITUTIONS:
         final_answer = final_answer.replace(before, after)
     for expr in REMOVED_EXPRESSIONS:
         final_answer = final_answer.replace(expr, "")
 
-    # Extract answer that is in LaTeX math, is bold,
-    # is surrounded by a box, etc.
-    final_answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", final_answer)
-    final_answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", final_answer)
-    final_answer = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", final_answer)
-    final_answer = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", final_answer)
-    final_answer = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", final_answer)
+    final_answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", r"$\3$", final_answer)
+    final_answer = re.sub(r"\\text\{(.*?)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\textbf\{(.*?)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\overline\{(.*?)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\boxed\{(.*?)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\box\{(.*?)\}", r"\1", final_answer)
 
-    # Normalize shorthand TeX:
-    #  \fracab -> \frac{a}{b}
-    #  \frac{abc}{bef} -> \frac{abc}{bef}
-    #  \fracabc -> \frac{a}{b}c
-    #  \sqrta -> \sqrt{a}
-    #  \sqrtab -> sqrt{a}b
-    final_answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", final_answer)
-    final_answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", final_answer)
-    final_answer = final_answer.replace("$", "")
+    final_answer = re.sub(r"(frac)([^{])(.)", r"frac{\2}{\3}", final_answer)
+    final_answer = re.sub(r"(sqrt)([^{])", r"sqrt{\2}", final_answer)
+    final_answer = final_answer.replace("$", "").strip()
 
-    # Normalize 100,000 -> 100000
     if final_answer.replace(",", "").isdigit():
         final_answer = final_answer.replace(",", "")
 

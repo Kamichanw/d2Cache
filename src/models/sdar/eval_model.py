@@ -19,21 +19,18 @@ class SDAREval(EvalMDLM):
     def __init__(self, cfg: DictConfig, **kwargs):
         super().__init__(cfg, **kwargs)
 
-        # Ensure tokenizer exposes mask_token_id for Frame decoding utilities.
-        if not hasattr(self.tokenizer, "mask_token_id") or self.tokenizer.mask_token_id is None:  # type: ignore[attr-defined]
-            setattr(self.tokenizer, "mask_token_id", cfg.generation.mask_token_id)
-
     def _encode_pair(self, context: str, continuation: str) -> tuple[list[int], list[int]]:
         n_spaces = len(context) - len(context.rstrip())
         if n_spaces > 0:
             continuation = context[-n_spaces:] + continuation
             context = context[:-n_spaces]
 
+        whole_enc: list[int] = self.tokenizer(context + continuation).input_ids
         context_enc: list[int] = self.tokenizer(context).input_ids
-        continuation_enc: list[int] = self.tokenizer(continuation).input_ids
+        continuation_enc = whole_enc[len(context_enc) :]
 
         if len(context_enc) == 0:
-            # For empty context, prepend the model prefix/BOS token so the first continuation token is scoreable.
+            # Empty contexts need one prefix token so the first continuation token is scoreable.
             context_enc = [int(self.prefix_token_id)]
 
         return context_enc, continuation_enc
@@ -58,7 +55,8 @@ class SDAREval(EvalMDLM):
             else:
                 context_len = len(context)
 
-            logits = self.model(input_ids).logits  # (1, L, V)
+            # Likelihood is a full causal pass; generation cache hooks are not involved.
+            logits = self.model(input_ids, use_cache=False).logits  # (1, L, V)
             log_probs = F.log_softmax(logits[:, :-1].to(torch.float32), dim=-1)
             target_ids = input_ids[:, 1:]
 
@@ -66,7 +64,9 @@ class SDAREval(EvalMDLM):
             cont_log_probs = log_probs[:, cont_start:]
             cont_targets = target_ids[:, cont_start:]
 
-            token_log_probs = cont_log_probs.gather(-1, cont_targets.unsqueeze(-1)).squeeze(-1)
+            token_log_probs = cont_log_probs.gather(
+                -1, cont_targets.unsqueeze(-1)
+            ).squeeze(-1)
             logprob = token_log_probs.sum().item()
 
             greedy = cont_log_probs.argmax(dim=-1)

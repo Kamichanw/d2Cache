@@ -115,14 +115,14 @@ When using parallel decoding, please disable certainty prior decoding explicitly
 # explicitly set generation.sigma to 0 to disable certainty prior guided decoding
 accelerate launch \
     --num_machines 1 \
-    --num_processes 1 \
+    --num_processes 4 \
     eval.py \
     dataset.name=humaneval_instruct \
     batch_size=1 \
     seed=1234 \
     attn_implementation=eager \
     cache=d2cache \
-    cache.rollour_p=0.1 \
+    cache.rollout_p=0.1 \
     cache.current_k=32 \
     cache.sigma=10 \
     cache.inflate_w=4 \
@@ -132,3 +132,28 @@ accelerate launch \
 
 > [!NOTE]
 > The `attn_implementation` parameter should be set to `eager` to obtain attention weights required by d2Cache.
+
+## BlockdCache: Exact KV Cache for Block Diffusion Decoding
+
+`BlockdCache` is the cache implementation for block diffusion models such as SDAR. It stores KV states by absolute token position and refreshes the active decoding block at each step. When a block is completed, the just-finished block is refreshed together with the next block on the following forward pass, so no extra commit forward is required.
+
+### Hyper-parameters
+
+`BlockdCache` does not introduce cache-specific hyper-parameters.
+
+### Example Usage
+
+```bash
+# Test BlockdCache on MATH-500 with SDAR-8B-Chat, run:
+accelerate launch \
+    --num_machines 1 \
+    --num_processes 4 \
+    eval.py \
+    dataset.name=math_instruct \
+    batch_size=1 \
+    seed=1234 \
+    cache=blockd \
+    generation=vanilla \
+    generation.block_length=32 \
+    model=sdar-8b-chat
+```

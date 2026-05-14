@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from src.cache import dCache
+from src.cache import BlockdCache, dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import (
     check_can_generate,
@@ -396,11 +396,11 @@ def wino_generate(
 
         start_frame = frame.clone()
         if cache is not None:
-            cache.on_block_start(model, block_mask, frame)
+            cache.on_block_start(block_mask, frame)
         block_deltas = []
         while True:
             if cache is not None:
-                cache.on_step_start(model, block_mask, frame)
+                cache.on_step_start(block_mask, frame)
             delta = wino_generate_step(
                 model=model,
                 frame=frame,
@@ -428,7 +428,7 @@ def wino_generate(
                 break
 
             if cache is not None:
-                cache.on_step_end(model, block_mask, frame, delta)
+                cache.on_step_end(block_mask, frame, delta)
 
             # update num_last_wide_in based on Wide In count
             num_last_wide_in = delta.extra.pop("num_last_wide_in")
@@ -440,7 +440,7 @@ def wino_generate(
                 break
 
         if cache is not None:
-            cache.on_block_end(model, block_mask, start_frame, block_deltas)
+            cache.on_block_end(block_mask, start_frame, block_deltas)
 
         deltas.extend(block_deltas)
         block_idx += 1

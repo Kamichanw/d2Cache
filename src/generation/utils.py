@@ -21,14 +21,13 @@ def get_initial_new_tokens(
     Return the number of masked tokens to place in the initial frame.
 
     Standard diffusion decoders allocate the whole fixed generation budget at
-    once. Block diffusion decoders allocate only enough tokens to finish the
-    current global block, then append later blocks as decoding progresses.
+    once. Block diffusion decoders allocate only the first block, 
+    then append later blocks as decoding progresses.
     """
     if not block_aligned:
         assert isinstance(max_new_tokens, int)
         return max_new_tokens
-    first_block = (-prompt_length) % block_length or block_length
-    return first_block if max_new_tokens is None else min(first_block, max_new_tokens)
+    return (-prompt_length) % block_length or block_length
 
 
 def get_block_mask(
@@ -40,10 +39,6 @@ def get_block_mask(
 ) -> torch.Tensor:
     """
     Build a boolean mask selecting the generation positions for one decode block.
-
-    For ordinary diffusion decoding, blocks are counted from the generated
-    suffix. For block diffusion, blocks are counted over the full sequence so a
-    prompt ending mid-block produces a shorter first generated block.
     """
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
@@ -59,7 +54,34 @@ def get_block_mask(
         start = block_idx * block_length
         block_mask = torch.zeros(gen_length, dtype=torch.bool, device=device)
         block_mask[start : start + block_length] = True
-    return block_mask.unsqueeze(0).expand(batch_size, -1).clone()
+    return block_mask.unsqueeze(0).repeat(batch_size, 1)
+
+
+def get_block_causal_attention_mask(
+    seq_length: int,
+    block_length: int,
+    batch_size: int,
+    device: torch.device,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Build the boolean attention mask used by block diffusion models.
+
+    Queries can attend to keys from the same or earlier block. If a 2D padding
+    mask is provided, padded key positions are masked out as well.
+    """
+    block_ids = torch.arange(seq_length, device=device).div(
+        block_length, rounding_mode="floor"
+    )
+    attn_mask = (
+        (block_ids[:, None] >= block_ids[None, :])
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(batch_size, -1, -1, -1)
+    )
+    if attention_mask is not None:
+        attn_mask = attn_mask & attention_mask[:, None, None, :seq_length].bool()
+    return attn_mask
 
 
 def prepare_logits_for_generation(model, logits: torch.Tensor):

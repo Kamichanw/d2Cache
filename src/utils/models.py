@@ -47,13 +47,13 @@ def load_eval_model(cfg: DictConfig, **model_kwargs):
 def load_tokenizer(cfg: DictConfig, **tokenizer_kwargs):
 
     # ---------------- Tokenizer loading ----------------
-    tokenizer_kwargs["trust_remote_code"] = True
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         cfg.model.path, **tokenizer_kwargs
     )
 
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.mask_token_id = cfg.generation.mask_token_id
 
     # ---------------- Model-specific customization ----------------
     model_family = cfg.model.name.split("-")[0]
@@ -84,32 +84,6 @@ def load_tokenizer(cfg: DictConfig, **tokenizer_kwargs):
     return tokenizer
 
 
-def is_adapted_from_ar(
-    model_or_config: PreTrainedModel | PretrainedConfig,
-) -> bool:
-    """
-    Check if a model or its configuration is adapted from an autoregressive architecture.
-    """
-
-    if isinstance(model_or_config, PreTrainedModel):
-        config = model_or_config.config
-    elif isinstance(model_or_config, PretrainedConfig):
-        config = model_or_config
-    else:
-        raise ValueError(
-            f"Expected model_or_config to be an instance of PreTrainedModel or PretrainedConfig, but got {type(model_or_config)}"
-        )
-
-    if config.model_type.lower() == "llada":
-        return False
-    elif config.model_type.lower() == "dream":
-        return True
-    elif config.model_type.lower() == "sdar":
-        return True
-    else:
-        raise ValueError(f"Unsupported model type: {config.model_type}")
-
-
 def is_block_diffusion(
     model_or_config: PreTrainedModel | PretrainedConfig,
 ) -> bool:
@@ -124,5 +98,7 @@ def is_block_diffusion(
         raise ValueError(
             f"Expected model_or_config to be an instance of PreTrainedModel or PretrainedConfig, but got {type(model_or_config)}"
         )
+    
+    BLOCK_DLLMS = ("sdar",)
 
-    return config.model_type.lower() == "sdar"
+    return config.model_type.lower() in BLOCK_DLLMS

@@ -41,7 +41,6 @@ from src.cache import dCache
 from .configuration_dream import DreamConfig
 from .generation_utils import DreamGenerationMixin, DreamGenerationConfig
 
-
 logger = logging.get_logger(__name__)
 
 
@@ -300,15 +299,13 @@ class DreamAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attn_norm: nn.Module,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: dCache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        position_embeddings: tuple[torch.Tensor, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # create a dummy cache to simplify code
         if past_key_values is None:
             past_key_values = dCache(self.config)
@@ -316,34 +313,30 @@ class DreamAttention(nn.Module):
         with past_key_values.attention(
             self.layer_idx,
             hidden_states,
-            attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
             attention_mask=attention_mask,
-            position_ids=position_ids,
         ) as ctx:
-            q_mismatch = ctx.q_position_ids is not None and ctx.q_position_ids.shape != (
-                ctx.q.size(0),
-                ctx.q.size(-2),
-            )
-            kv_mismatch = ctx.kv_position_ids is not None and ctx.kv_position_ids.shape != (
-                ctx.k.size(0),
-                ctx.k.size(-2),
-            )
-            if q_mismatch or kv_mismatch:
-                raise ValueError(
-                    "If you select a subset of the qkv in past_key_values, "
-                    "the q, k, v must match the shape of corresponding position_ids."
-                )
-
             bsz = ctx.q.size(0)
             q, k, v = ctx.q, ctx.k, ctx.v
 
-            cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
-            k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
-            cos, sin = self.rotary_emb(q, ctx.q_position_ids)
-            q = (q * cos.unsqueeze(1)) + (rotate_half(q) * sin.unsqueeze(1))
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                active_q_mask = (
+                    past_key_values.active_q_mask
+                    if past_key_values is not None
+                    else None
+                )
+                if cos.size(-2) != q.size(-2):
+                    assert active_q_mask is not None
+                    cos = cos[active_q_mask].view(q.size(0), q.size(-2), cos.size(-1))
+                    sin = sin[active_q_mask].view(q.size(0), q.size(-2), sin.size(-1))
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+            k, v = past_key_values.update(
+                k, v, self.layer_idx, cache_kwargs=past_key_values.cache_kwargs
+            )
 
             # repeat k/v heads if n_kv_heads < n_heads
             k = repeat_kv(k, self.num_key_value_groups)
@@ -368,12 +361,12 @@ class DreamAttention(nn.Module):
 
             o = self.o_proj(attn_output)
             ctx.o = o
-            ctx.attn_weight = attn_weights
+            ctx.attn_weights = attn_weights
 
         if not output_attentions:
             attn_weights = None
 
-        return ctx.o, attn_weights, ctx.residual
+        return ctx.o, attn_weights
 
 
 class DreamSdpaAttention(DreamAttention):
@@ -387,15 +380,13 @@ class DreamSdpaAttention(DreamAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attn_norm: nn.Module,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: dCache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        position_embeddings: tuple[torch.Tensor, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -404,12 +395,12 @@ class DreamSdpaAttention(DreamAttention):
             )
             return super().forward(
                 hidden_states=hidden_states,
-                attn_norm=attn_norm,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                position_embeddings=position_embeddings,
             )
 
         # create a dummy cache to simplify code
@@ -419,42 +410,34 @@ class DreamSdpaAttention(DreamAttention):
         with past_key_values.attention(
             self.layer_idx,
             hidden_states,
-            attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
             attention_mask=attention_mask,
-            position_ids=position_ids,
         ) as ctx:
-            q_mismatch = ctx.q_position_ids is not None and ctx.q_position_ids.shape != (
-                ctx.q.size(0),
-                ctx.q.size(-2),
-            )
-            kv_mismatch = ctx.kv_position_ids is not None and ctx.kv_position_ids.shape != (
-                ctx.k.size(0),
-                ctx.k.size(-2),
-            )
-            if q_mismatch or kv_mismatch:
-                raise ValueError(
-                    "If you select a subset of the qkv in past_key_values, "
-                    "the q, k, v must match the shape of corresponding position_ids."
-                )
-
             bsz = ctx.q.size(0)
             q, k, v = ctx.q, ctx.k, ctx.v
 
-            cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
-            k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
-            cos, sin = self.rotary_emb(q, ctx.q_position_ids)
-            q = (q * cos.unsqueeze(1)) + (rotate_half(q) * sin.unsqueeze(1))
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                active_q_mask = (
+                    past_key_values.active_q_mask
+                    if past_key_values is not None
+                    else None
+                )
+                if cos.size(-2) != q.size(-2):
+                    assert active_q_mask is not None
+                    cos = cos[active_q_mask].view(q.size(0), q.size(-2), cos.size(-1))
+                    sin = sin[active_q_mask].view(q.size(0), q.size(-2), sin.size(-1))
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+            cache_kwargs = past_key_values.cache_kwargs
+            if cache_kwargs is not None:
+                k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
             # repeat k/v heads if n_kv_heads < n_heads
             k = repeat_kv(k, self.num_key_value_groups)
             v = repeat_kv(v, self.num_key_value_groups)
-
-            # causal_mask = attention_mask
-            # if attention_mask is not None:  # no matter the length, we just slice it
-            #     causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
             # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
             # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -463,10 +446,6 @@ class DreamSdpaAttention(DreamAttention):
                 k = k.contiguous()
                 v = v.contiguous()
 
-            # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-            # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-            # is_causal = True if causal_mask is None and q_len > 1 else False
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
@@ -485,9 +464,9 @@ class DreamSdpaAttention(DreamAttention):
 
             o = self.o_proj(attn_output)
             ctx.o = o
-            ctx.attn_weight = None  # SDPA does not return attention weights
+            ctx.attn_weights = None  # SDPA does not return attention weights
 
-        return ctx.o, None, ctx.residual
+        return ctx.o, None
 
 
 DREAM_ATTENTION_CLASSES = {
@@ -525,8 +504,9 @@ class DreamDecoderLayer(nn.Module):
         past_key_values: dCache | None = None,
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
+        position_embeddings: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None,  # will become mandatory in v4.46
         **kwargs,
     ):
         """
@@ -541,8 +521,6 @@ class DreamDecoderLayer(nn.Module):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
             past_key_values (`dCache`, *optional*): cached past key and value projection states
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
             position_embeddings (`tuple[torch.Tensor, torch.Tensor]`, *optional*):
                 tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
@@ -555,27 +533,28 @@ class DreamDecoderLayer(nn.Module):
             past_key_values = dCache(self.config)
 
         # Self Attention
-        hidden_states, self_attn_weights, residual = self.self_attn(
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            attn_norm=self.input_layernorm,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
 
         hidden_states = residual + hidden_states
 
         # Fully Connected
+        residual = hidden_states
         with past_key_values.ffn(self.layer_idx, hidden_states) as ctx:
-            hidden_states = self.post_attention_layernorm(ctx.x)
+            hidden_states = self.post_attention_layernorm(ctx.hidden_states)
             hidden_states = self.mlp(hidden_states)
             ctx.ffn_out = hidden_states
 
-        hidden_states = ctx.residual + ctx.ffn_out
+        hidden_states = residual + ctx.ffn_out
 
         outputs = (hidden_states,)
 
@@ -712,7 +691,6 @@ class DreamBaseModel(DreamPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
     ) -> tuple | BaseModelOutput:
         output_attentions = (
             output_attentions
@@ -757,13 +735,18 @@ class DreamBaseModel(DreamPreTrainedModel):
                 .expand(inputs_embeds.shape[0], -1)
             )
 
-        cm = past_key_values.model_forward(inputs_embeds)
+        cm = past_key_values.model_forward(
+            inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
         ctx = cm.__enter__()
-        hidden_states = ctx.x
+        hidden_states = ctx.input_embeds
+        position_ids = ctx.position_ids
+        attention_mask = ctx.attention_mask
 
         # create position embeddings to be shared across the decoder layers
-        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings = None
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -782,7 +765,6 @@ class DreamBaseModel(DreamPreTrainedModel):
                     past_key_values,
                     output_attentions,
                     use_cache,
-                    cache_position,
                     position_embeddings,
                 )
             else:
@@ -793,7 +775,6 @@ class DreamBaseModel(DreamPreTrainedModel):
                     past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
 
@@ -873,7 +854,6 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         num_logits_to_keep: int = 0,
         **loss_kwargs,
     ) -> tuple | MaskedLMOutput:
@@ -902,7 +882,6 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,  # hard coded
-            cache_position=cache_position,
         )
 
         hidden_states = outputs[0]

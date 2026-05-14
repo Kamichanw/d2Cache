@@ -14,21 +14,26 @@ Subclasses should override the following methods to implement specific caching b
 *   **`__init__(self, model_config, ...)`**: 
     Initializes the cache instance. This is where internal storage structures (e.g., lists for Key/Value tensors) should be instantiated.
 
-*   **`model_forward(self, x: torch.Tensor)`**: 
-    A context manager invoked wrapping the entire model forward pass. It allows for the modification of input embeddings or the preparation of global masks before layer-wise computations begin.
+*   **`model_forward(self, x, position_ids=None, attention_mask=None)`**:
+    A context manager invoked around the entire model forward pass. It yields a `ModelForwardContext`, whose `input_embeds`, `position_ids`, and `attention_mask` fields are consumed by the model before layer-wise computation begins. Cache implementations that slice the sequence should restore `ctx.logits` before the context exits.
 
 *   **`attention(self, layer_idx, ...)`**: 
     This is the most critical context manager for caching implementations. It intercepts the attention computation at each layer.
-    *   **Input**: Receives the layer index, input tensor `x`, and projection layers (`q_proj`, `k_proj`, `v_proj`).
+    *   **Input**: Receives the layer index, normalized input tensor `hidden_states`, and projection layers (`q_proj`, `k_proj`, `v_proj`).
     *   **Operation**: The implementation should compute or retrieve the Query, Key, and Value states. It must yield an `AttentionContext` object.
-    *   **Usage**: This method is typically used to store computed K/V pairs for future reuse or to modify the attention mask to enforce specific sparsity patterns.
+    *   **Usage**: This method is typically used to store computed K/V pairs for future reuse or to modify the attention mask to enforce specific sparsity patterns. Layer implementations should assign `ctx.o`, and may assign `ctx.attn_weights` when attention weights are needed.
 
-*   **`ffn(self, layer_idx, x)`**: 
-    A context manager for the Feed-Forward Network (FFN) layers, allowing for the inspection or modification of FFN inputs and outputs.
+*   **`ffn(self, layer_idx, hidden_states)`**: 
+    A context manager for the Feed-Forward Network (FFN) layers. It yields an `FFNContext`; model code should read `ctx.hidden_states`, compute the FFN output, and assign `ctx.ffn_out`.
+
+*   **`cache_kwargs`**:
+    A property read by model attention modules when they call `past_key_values.update(...)`. The base implementation provides `active_rows` and, when `active_q_mask` is set, `cache_position`. Subclasses can override it to pass cache-specific metadata to their layer caches.
 
 *   **Lifecycle Hooks**:
+    *   `on_block_start(self, block_mask, frame)`: Executed before decoding a block. Useful for initializing block-local state.
     *   `on_step_start(self, block_mask, frame)`: Executed at the beginning of each generation step. Useful for preparing masks based on the current generation status.
     *   `on_step_end(self, block_mask, frame, delta)`: Executed after the generation step. This is where the cache should be updated with the newly generated information (e.g., updating confidence scores or density metrics).
+    *   `on_block_end(self, block_mask, frame, deltas)`: Executed after a block finishes. Block-level caches can use this hook to prepare state for the next block.
 
 ### Configuration
 To use your custom cache, create a new YAML configuration file in `configs/cache/` (e.g., `configs/cache/my_cache.yaml`).

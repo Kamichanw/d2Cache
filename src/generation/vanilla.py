@@ -3,17 +3,18 @@ import torch.nn.functional as F
 import torch.distributions as dists
 from typing import Any, Callable
 
-from src.cache import BlockdCache, dCache
+from src.cache import dCache
 from src.frame import INVALID_TOKEN_ID, Frame, FrameDelta, DecodeRecord, Intermediate
 from src.generation.utils import (
     check_can_generate,
+    get_block_causal_attention_mask,
     get_block_mask,
     get_initial_new_tokens,
     prepare_logits_for_generation,
     sample_tokens,
     register,
 )
-from src.utils import certainty_density, is_adapted_from_ar, is_block_diffusion
+from src.utils import certainty_density, is_block_diffusion
 
 
 def maybe_extend_new_block(
@@ -144,66 +145,37 @@ def generate_step(
 ) -> FrameDelta | None:
     frame = frame.as_batch()
     batch_size, prompt_length = frame.prompts.shape
-    gen_length = frame.generated_tokens.size(1)
     device = block_mask.device
-    x_full = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)
+    input_ids = torch.cat([frame.prompts, frame.generated_tokens], dim=-1)
 
-    is_blockd_cache = isinstance(cache, BlockdCache)
-    padding_attention_mask = (
+    input_padding_mask = (
         attention_mask
         if attention_mask is not None and attention_mask.dim() == 2
         else None
     )
 
-    if is_block_diffusion(model) and not is_blockd_cache:
-        block_ids = torch.arange(x_full.size(-1), device=device).div(
-            block_length, rounding_mode="floor"
+    if is_block_diffusion(model):
+        attention_mask = get_block_causal_attention_mask(
+            seq_length=input_ids.size(-1),
+            block_length=block_length,
+            batch_size=batch_size,
+            device=device,
+            attention_mask=input_padding_mask,
         )
-        attention_mask = (
-            (block_ids[:, None] >= block_ids[None, :])
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand(batch_size, -1, -1, -1)
-        )
-        if padding_attention_mask is not None:
-            attention_mask = attention_mask & padding_attention_mask[
-                :, None, None, : x_full.size(-1)
-            ].bool()
 
-    if padding_attention_mask is not None:
-        position_ids = padding_attention_mask.cumsum(dim=-1) - 1
-        position_ids.masked_fill_(padding_attention_mask == 0, 0)
+    if input_padding_mask is not None:
+        position_ids = input_padding_mask.cumsum(dim=-1) - 1
+        position_ids.masked_fill_(input_padding_mask == 0, 0)
     else:
         position_ids = (
             torch.arange(
-                x_full.size(-1),
+                input_ids.size(-1),
                 dtype=torch.long,
                 device=device,
             )
             .unsqueeze(0)
             .expand(batch_size, -1)
         )
-
-    if is_blockd_cache:
-        if cache.get_seq_length() == 0:
-            # cache prefilling
-            cache.active_seq_mask = torch.ones(
-                batch_size, dtype=torch.bool, device=device
-            )
-            cache.active_q_mask = F.pad(
-                torch.ones(batch_size, prompt_length, dtype=torch.bool, device=device),
-                (0, gen_length),
-                value=False,
-            )
-            model(
-                x_full,
-                attention_mask=padding_attention_mask,
-                position_ids=position_ids,
-                output_hidden_states=False,
-                past_key_values=cache,
-                use_cache=True,
-            )
-        cache.active_q_mask = F.pad(block_mask, (prompt_length, 0), value=False)
 
     can_generate = check_can_generate(
         frame,
@@ -227,7 +199,7 @@ def generate_step(
         attention_mask = attention_mask[active_seq_idx]
     block_mask = block_mask[active_seq_idx]
     outputs = model(
-        x_full[active_seq_idx],
+        input_ids[active_seq_idx],
         attention_mask=attention_mask,
         position_ids=position_ids[active_seq_idx],
         output_hidden_states=output_hidden_states,
@@ -240,7 +212,7 @@ def generate_step(
         active_q_mask = cache.active_q_mask
         if active_q_mask.size(0) == batch_size:
             active_q_mask = active_q_mask[active_seq_idx]
-        if is_adapted_from_ar(model) and not is_blockd_cache:
+        if model.config.model_type.lower() == "dream":
             valid_mask = active_q_mask[:, prompt_length - 1 : -1]
         else:
             valid_mask = active_q_mask[:, prompt_length:]
@@ -503,16 +475,20 @@ def vanilla_generate(
         assert stop_until_eos and isinstance(eos_token_id, int)
 
     block_aligned = is_block_diffusion(model)
-    initial_frame = Frame.create_initial_frame(
-        input_ids,
-        num_new_tokens=get_initial_new_tokens(
-            input_ids.size(-1),
-            block_length,
-            max_new_tokens,
-            block_aligned=block_aligned,
-        ),
-        mask_token_id=mask_token_id,
-    ).to(device=model.device, dtype=model.dtype).as_batch()
+    initial_frame = (
+        Frame.create_initial_frame(
+            input_ids,
+            num_new_tokens=get_initial_new_tokens(
+                input_ids.size(-1),
+                block_length,
+                max_new_tokens,
+                block_aligned=block_aligned,
+            ),
+            mask_token_id=mask_token_id,
+        )
+        .to(device=model.device, dtype=model.dtype)
+        .as_batch()
+    )
     frame = initial_frame
 
     def unmasking_fn(
@@ -554,11 +530,11 @@ def vanilla_generate(
 
         start_frame = frame.clone()
         if cache is not None:
-            cache.on_block_start(model, block_mask, frame)
+            cache.on_block_start(block_mask, frame)
         block_deltas = []
         while True:
             if cache is not None:
-                cache.on_step_start(model, block_mask, frame)
+                cache.on_step_start(block_mask, frame)
             delta = generate_step(
                 model=model,
                 frame=frame,
@@ -586,7 +562,7 @@ def vanilla_generate(
                 # if no more mask tokens are left, break the loop
                 break
             if cache is not None:
-                cache.on_step_end(model, block_mask, frame, delta)
+                cache.on_step_end(block_mask, frame, delta)
 
             prev_length = frame.generated_tokens.size(-1)
             block_deltas.append(delta.to("cpu"))
@@ -596,7 +572,7 @@ def vanilla_generate(
                 break
 
         if cache is not None:
-            cache.on_block_end(model, block_mask, start_frame, block_deltas)
+            cache.on_block_end(block_mask, start_frame, block_deltas)
 
         deltas.extend(block_deltas)
         block_idx += 1

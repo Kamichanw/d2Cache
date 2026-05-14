@@ -55,7 +55,7 @@ def main(cfg: DictConfig) -> None:
     model = load_eval_model(cfg, extra_gen_kwargs=extra_cfg.get("extra_gen_kwargs"))
     output_dir = HydraConfig.get().runtime.output_dir
 
-    patcher_ctx = sympy_antlr_patcher if cfg.dataset.name == "math-500" else nullcontext
+    patcher_ctx = sympy_antlr_patcher if cfg.dataset.name.startswith("math") else nullcontext
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     with patcher_ctx():

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from abc import abstractmethod
-from collections.abc import MutableMapping
 from typing import cast
 from dataclasses import dataclass
 
@@ -10,7 +9,7 @@ import torch
 import torch.backends.cuda
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import einsum
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils.generic import ModelOutput
 from transformers.models.auto import AutoModel
@@ -25,7 +24,6 @@ from .configuration_llada import (
     BlockType,
     LayerNormType,
 )
-
 
 __all__ = [
     "LayerNormBase",
@@ -55,24 +53,6 @@ class ModuleType(StrEnum):
     out_module = "out"
     emb = "emb"
     final_out = "final_out"
-
-
-class BufferCache(dict, MutableMapping[str, torch.Tensor]):  # type: ignore
-    """
-    Cache for attention biases and other things that would normally be stored as buffers.
-    We avoid using buffers because we've run into various issues doing so with FSDP.
-    In general it appears the way FSDP handles buffers is not well-defined.
-    It doesn't shard them but apparently it does synchronize them across processes, which we want to avoid
-    since (A) it isn't necessary, and (B) we sometimes have `-inf` in these biases which might get turned into
-    NaNs when they're synchronized due to casting or some other issue.
-    """
-
-
-def _non_meta_init_device(config: LLaDAConfig) -> torch.device:
-    if config.init_device is not None and config.init_device != "meta":
-        return torch.device(config.init_device)
-    else:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Dropout(nn.Dropout):
@@ -277,96 +257,115 @@ class RotaryEmbedding(nn.Module):
     [Rotary positional embeddings (RoPE)](https://arxiv.org/abs/2104.09864).
     """
 
-    def __init__(self, config: LLaDAConfig, cache: BufferCache):
+    def __init__(self, config: LLaDAConfig, device: torch.device | None = None):
         super().__init__()
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
+        else:
+            self.rope_type = "default"
+        if not hasattr(config, "max_position_embeddings"):
+            config.max_position_embeddings = config.max_sequence_length
+        max_position_embeddings = config.max_position_embeddings
+        self.max_seq_len_cached = max_position_embeddings
+        self.original_max_seq_len = max_position_embeddings
+
         self.config = config
-        self.__cache = cache
-        # Warm up cache.
-        self.rope_theta = config.rope_theta
-        self.get_rotary_embedding(
-            config.max_sequence_length, _non_meta_init_device(config)
-        )
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-    def get_rotary_embedding(
-        self, seq_len: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids: torch.Tensor, device):
+        """
+        Dynamic RoPE recomputes `inv_freq` when the sequence grows beyond the
+        cached length, and resets when it returns to the original scale.
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.max_seq_len_cached = seq_len
+
         if (
-            (pos_sin := self.__cache.get("rope_pos_sin")) is not None
-            and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
-            and pos_sin.shape[-2] >= seq_len
-            and pos_cos.shape[-2] >= seq_len
+            seq_len < self.original_max_seq_len
+            and self.max_seq_len_cached > self.original_max_seq_len
         ):
-            if pos_sin.device != device:
-                pos_sin = pos_sin.to(device)
-                self.__cache["rope_pos_sin"] = pos_sin
-            if pos_cos.device != device:
-                pos_cos = pos_cos.to(device)
-                self.__cache["rope_pos_cos"] = pos_cos
-            return pos_sin, pos_cos
-
-        with torch.autocast(device.type, enabled=False):
-            dim = self.config.d_model // self.config.n_heads
-            inv_freq = 1.0 / (
-                self.rope_theta
-                ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
-            )
-            seq = torch.arange(seq_len, device=device, dtype=torch.float)
-            freqs = einsum("i , j -> i j", seq, inv_freq)
-            positions = torch.cat((freqs, freqs), dim=-1)
-            pos_sin, pos_cos = (
-                positions.sin()[None, None, :, :],
-                positions.cos()[None, None, :, :],
-            )
-        self.__cache["rope_pos_sin"] = pos_sin
-        self.__cache["rope_pos_cos"] = pos_cos
-        return pos_sin, pos_cos
-
-    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        B, nh, T, hs = x.size()
-        x = x.view(B, nh, T, 2, hs // 2)
-        x1, x2 = x.unbind(dim=-2)
-        return torch.cat((-x2, x1), dim=-1)
-
-    def apply_rotary_pos_emb(
-        self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor
-    ) -> torch.Tensor:
-        return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)  # type: ignore
+            self.max_seq_len_cached = self.original_max_seq_len
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        q_position_ids: torch.Tensor | None = None,
-        kv_position_ids: torch.Tensor | None = None,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.config.rope_full_precision:
-            q_, k_ = q.float(), k.float()
-        else:
-            q_, k_ = q, k
+        if position_ids is None:
+            position_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
 
-        if q_position_ids is None:
-            q_len = q.shape[2]
-            q_position_ids = torch.arange(q_len, device=q.device).unsqueeze(0)
+        if "dynamic" in self.rope_type and position_ids.numel() > 0:
+            self._dynamic_frequency_update(position_ids, device=x.device)
 
-        if kv_position_ids is None:
-            k_len = k.shape[2]
-            kv_position_ids = torch.arange(k_len, device=k.device).unsqueeze(0)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]  # type: ignore
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = x.device.type
+        device_type = (
+            device_type
+            if isinstance(device_type, str) and device_type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
 
-        max_pos = int(torch.max(q_position_ids.max(), kv_position_ids.max()).item())
-        pos_sin, pos_cos = self.get_rotary_embedding(max_pos + 1, q_.device)
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-        pos_sin = pos_sin.squeeze(0).squeeze(0)
-        pos_cos = pos_cos.squeeze(0).squeeze(0)
 
-        sin_q = pos_sin[q_position_ids].type_as(q_)
-        cos_q = pos_cos[q_position_ids].type_as(q_)
-        q_ = self.apply_rotary_pos_emb(sin_q.unsqueeze(1), cos_q.unsqueeze(1), q_)
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-        sin_k = pos_sin[kv_position_ids].type_as(k_)
-        cos_k = pos_cos[kv_position_ids].type_as(k_)
-        k_ = self.apply_rotary_pos_emb(sin_k.unsqueeze(1), cos_k.unsqueeze(1), k_)
 
-        return q_.type_as(q), k_.type_as(k)
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class Activation(nn.Module):
@@ -444,16 +443,15 @@ class LLaDABlock(nn.Module):
     A base class for transformer block implementations.
     """
 
-    def __init__(self, layer_id: int, config: LLaDAConfig, cache: BufferCache):
+    def __init__(self, layer_idx: int, config: LLaDAConfig):
         super().__init__()
-        self.layer_id = layer_id
+        self.layer_idx = layer_idx
         self.config = config
         self.hidden_size = (
             config.mlp_hidden_size
             if config.mlp_hidden_size is not None
             else config.mlp_ratio * config.d_model
         )
-        self.__cache = cache
         assert config.d_model % config.n_heads == 0
 
         # Dropout.
@@ -482,7 +480,7 @@ class LLaDABlock(nn.Module):
             config.d_model,
             bias=config.include_bias,
         )
-        setattr(self.attn_out, "layer_id", layer_id)
+        setattr(self.attn_out, "layer_idx", layer_idx)
         setattr(self.attn_out, "type_of_module", ModuleType.out_module)
 
         # Feed-forward output projection.
@@ -492,12 +490,12 @@ class LLaDABlock(nn.Module):
             bias=config.include_bias,
         )
         setattr(self.ff_out, "_is_residual", True)
-        setattr(self.ff_out, "layer_id", layer_id)
+        setattr(self.ff_out, "layer_idx", layer_idx)
         setattr(self.ff_out, "type_of_module", ModuleType.out_module)
 
         # Rotary embeddings.
         if self.config.rope:
-            self.rotary_emb = RotaryEmbedding(config, self.__cache)
+            self.rotary_emb = RotaryEmbedding(config)
 
         self.flash_attn_func = None
         if config.flash_attention:
@@ -565,8 +563,8 @@ class LLaDABlock(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        q_position_ids: torch.Tensor | None = None,
-        kv_position_ids: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past_key_values: dCache | None = None,
         output_attentions: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T = q.size(0), q.size(-2)
@@ -581,19 +579,36 @@ class LLaDABlock(nn.Module):
                 .transpose(1, 2)
             )
             k = (
-                self.k_norm(k.transpose(1, 2).contiguous().view(k.size(0), k.size(-2), -1))
+                self.k_norm(
+                    k.transpose(1, 2).contiguous().view(k.size(0), k.size(-2), -1)
+                )
                 .to(dtype=dtype)
-                .view(k.size(0), k.size(-2), self.config.effective_n_kv_heads, k.size(-1))
+                .view(
+                    k.size(0), k.size(-2), self.config.effective_n_kv_heads, k.size(-1)
+                )
                 .transpose(1, 2)
             )
 
-        if self.config.rope:
+        if self.config.rope and position_embeddings is not None:
             # Apply rotary embeddings.
-            q, k = self.rotary_emb(q, k, q_position_ids, kv_position_ids)
+            cos, sin = position_embeddings
+            active_q_mask = (
+                past_key_values.active_q_mask if past_key_values is not None else None
+            )
+            if cos.size(-2) != q.size(-2):
+                assert active_q_mask is not None
+                cos = cos[active_q_mask].view(q.size(0), q.size(-2), cos.size(-1))
+                sin = sin[active_q_mask].view(q.size(0), q.size(-2), sin.size(-1))
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if past_key_values is not None:
+            k, v = past_key_values.update(
+                k, v, self.layer_idx, cache_kwargs=past_key_values.cache_kwargs
+            )
 
         # Get the attention scores.
         # shape: (B, nh, T, hs)
-        att, attn_weight = self._scaled_dot_product_attention(
+        att, attn_weights = self._scaled_dot_product_attention(
             q,
             k,
             v,
@@ -607,25 +622,23 @@ class LLaDABlock(nn.Module):
         att = att.transpose(1, 2).contiguous().view(B, -1, self.config.d_model)
 
         # Apply output projection.
-        return self.attn_out(att), attn_weight
+        return self.attn_out(att), attn_weights
 
     @abstractmethod
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: torch.FloatTensor | None = None,
-        position_ids: torch.Tensor | None = None,
         past_key_values: dCache | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         output_attentions: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         raise NotImplementedError
 
     @classmethod
-    def build(
-        cls, layer_id: int, config: LLaDAConfig, cache: BufferCache
-    ) -> LLaDABlock:
+    def build(cls, layer_idx: int, config: LLaDAConfig) -> LLaDABlock:
         if config.block_type == BlockType.llama:
-            return LLaDALlamaBlock(layer_id, config, cache)
+            return LLaDALlamaBlock(layer_idx, config)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
@@ -638,8 +651,8 @@ class LLaDALlamaBlock(LLaDABlock):
     behavior of Llama.
     """
 
-    def __init__(self, layer_id: int, config: LLaDAConfig, cache: BufferCache):
-        super().__init__(layer_id, config, cache)
+    def __init__(self, layer_idx: int, config: LLaDAConfig):
+        super().__init__(layer_idx, config)
         # Layer norms.
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
@@ -680,14 +693,14 @@ class LLaDALlamaBlock(LLaDABlock):
         # Add metadata for init
         for proj in [self.q_proj, self.k_proj, self.v_proj, self.ff_proj, self.up_proj]:
             setattr(proj, "type_of_module", ModuleType.in_module)
-            setattr(proj, "layer_id", layer_id)
+            setattr(proj, "layer_idx", layer_idx)
 
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
         past_key_values: dCache | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         output_attentions: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Get query, key, value projections.
@@ -701,63 +714,50 @@ class LLaDALlamaBlock(LLaDABlock):
         # create a dummy cache to simplify code
         if past_key_values is None:
             past_key_values = dCache(self.config)
+        residual = x
+        x = self.attn_norm(x)
         with past_key_values.attention(
-            self.layer_id,
+            self.layer_idx,
             x,
-            self.attn_norm,
             self.q_proj,
             self.k_proj,
             self.v_proj,
             attention_mask=attention_mask,
-            position_ids=position_ids,
         ) as ctx:
-            q_mismatch = ctx.q_position_ids is not None and ctx.q_position_ids.shape != (
-                ctx.q.size(0),
-                ctx.q.size(-2),
-            )
-            kv_mismatch = ctx.kv_position_ids is not None and ctx.kv_position_ids.shape != (
-                ctx.k.size(0),
-                ctx.k.size(-2),
-            )
-            if q_mismatch or kv_mismatch:
-                raise ValueError(
-                    "If you select a subset of the qkv in past_key_values, "
-                    "the q, k, v must match the shape of corresponding position_ids."
-                )
-
             if ctx.q.numel() > 0:
-                ctx.o, ctx.attn_weight = self.attention(
+                ctx.o, ctx.attn_weights = self.attention(
                     ctx.q,
                     ctx.k,
                     ctx.v,
                     ctx.attention_mask,
-                    q_position_ids=ctx.q_position_ids,
-                    kv_position_ids=ctx.kv_position_ids,
+                    position_embeddings=position_embeddings,
+                    past_key_values=past_key_values,
                     output_attentions=bool(output_attentions)
                     or isinstance(past_key_values, d2Cache),
                 )
             else:
-                ctx.o = ctx.residual.new_empty(
+                ctx.o = residual.new_empty(
                     ctx.q.size(0), ctx.q.size(-2), self.config.d_model
                 )
-                ctx.attn_weight = None
+                ctx.attn_weights = None
 
         q, k, v, o = ctx.q, ctx.k, ctx.v, ctx.o  # keep them for visualization
-        attn_weight = ctx.attn_weight
-        x = ctx.residual + self.dropout(ctx.o)
+        attn_weights = ctx.attn_weights
+        x = residual + self.dropout(ctx.o)
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
-        with past_key_values.ffn(self.layer_id, x) as ctx:
-            x = self.ff_norm(ctx.x)
+        residual = x
+        with past_key_values.ffn(self.layer_idx, x) as ctx:
+            x = self.ff_norm(ctx.hidden_states)
             x, x_up = self.ff_proj(x), self.up_proj(x)  # new add
             x = self.act(x)
             x = x * x_up  # new add
             x = self.ff_out(x)
             ctx.ffn_out = x
 
-        x = ctx.residual + self.dropout(ctx.ffn_out)
-        return x, attn_weight
+        x = residual + self.dropout(ctx.ffn_out)
+        return x, attn_weights
 
 
 @dataclass
@@ -841,7 +841,7 @@ class LLaDAPreTrainedModel(PreTrainedModel):
             return
 
         # Extract metadata attached to the module
-        layer_id = getattr(module, "layer_id", None)
+        layer_idx = getattr(module, "layer_idx", None)
         type_of_module = getattr(module, "type_of_module", None)
 
         d = config.d_model
@@ -864,8 +864,8 @@ class LLaDAPreTrainedModel(PreTrainedModel):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
         elif config.init_fn == InitFnType.mitchell:
             std = std_factor / math.sqrt(d)
-            if layer_id is not None:
-                std /= math.sqrt(2 * (layer_id + 1))
+            if layer_idx is not None:
+                std /= math.sqrt(2 * (layer_idx + 1))
             nn.init.trunc_normal_(
                 module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std
             )
@@ -913,8 +913,6 @@ class LLaDAModel(LLaDAPreTrainedModel):
     def __init__(self, config: LLaDAConfig):
         super().__init__(config)
         self.config = config
-        self.__cache = BufferCache()
-
         if (
             self.config.embedding_size is not None
             and self.config.embedding_size != self.config.vocab_size
@@ -950,11 +948,11 @@ class LLaDAModel(LLaDAPreTrainedModel):
         )
         setattr(self.transformer.wte, "type_of_module", ModuleType.emb)
 
-        blocks = [
-            LLaDABlock.build(i, config, self.__cache) for i in range(config.n_layers)
-        ]
+        blocks = [LLaDABlock.build(i, config) for i in range(config.n_layers)]
         assert self.config.block_group_size == 1
         self.transformer.update({"blocks": nn.ModuleList(blocks)})
+        if self.config.rope:
+            self.rotary_emb = RotaryEmbedding(config)
 
         if not (self.config.alibi or self.config.rope):
             wpe = nn.Embedding(
@@ -1055,8 +1053,17 @@ class LLaDAModel(LLaDAPreTrainedModel):
         all_attentions = []
         all_hidden_states = []
 
-        with past_key_values.model_forward(x) as ctx:
-            x = ctx.x
+        with past_key_values.model_forward(
+            x,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        ) as ctx:
+            x = ctx.input_embeds
+            position_ids = ctx.position_ids
+            attention_mask = ctx.attention_mask
+            position_embeddings = (
+                self.rotary_emb(x, position_ids) if self.config.rope else None
+            )
             # Apply blocks one-by-one.
             for block in self.transformer.blocks:  # type: ignore
                 if output_hidden_states:
@@ -1066,17 +1073,17 @@ class LLaDAModel(LLaDAPreTrainedModel):
                         block.__call__,
                         x,
                         attention_mask,
-                        position_ids,
                         None,  # past_key_values must be None for checkpointing
+                        position_embeddings,
                         output_attentions,
                     )
                 else:
                     layer_outputs = block(
                         x,
                         attention_mask=attention_mask,
-                        position_ids=position_ids,
                         past_key_values=past_key_values,
                         output_attentions=output_attentions,
+                        position_embeddings=position_embeddings,
                     )
 
                 x = layer_outputs[0]
