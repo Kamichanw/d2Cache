@@ -12,7 +12,7 @@ To facilitate the analysis and logging of the generation process, we have design
 
 The implementations of the generation methods are located in the `src/generation/` directory.
 
-- `src/generation/vanilla.py` provides the standard iterative decoding loop. It handles normal diffusion decoding, block-diffusion decoding, parallel token transfer from [Fast dLLM](https://arxiv.org/abs/2505.22618), and trivial token debiasing from [PC-Sampler](https://arxiv.org/abs/2508.13021), etc.
+- `src/generation/vanilla.py` provides the standard iterative decoding loop. It handles normal diffusion decoding, block-diffusion decoding, parallel token transfer from [Fast dLLM](https://arxiv.org/abs/2505.22618), and trivial token debiasing from [PC-Sampler (published as UNCODE)](https://aclanthology.org/2026.acl-long.311/), etc.
 - `src/generation/ar.py`, `src/generation/klass.py`, and `src/generation/wino.py` provide additional decoding variants that reuse the same `Frame` / `FrameDelta` / cache hook structure.
 
 
